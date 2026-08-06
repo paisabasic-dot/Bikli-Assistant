@@ -1,0 +1,942 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Custom smooth transition classes */
+.theme-transition {
+  transition: background-color 1.2s cubic-bezier(0.4, 0, 0.2, 1), 
+              background-image 1.2s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.8s ease;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-10px); }
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+/* Fade-in animation used by BrowserAgent and BikliCoreVisualizer */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out;
+}
+
+/* Custom scrollbar utilities (Tailwind v4 does not include these) */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.3) transparent;
+}
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(34, 211, 238, 0.3);
+  border-radius: 999px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(34, 211, 238, 0.5);
+}
+
+/* Radial gradient background utility (not in Tailwind v4 by default) */
+.bg-radial-gradient {
+  background: radial-gradient(var(--tw-gradient-stops));
+}
+
+/* ── Recollections (Recalls) attractive scroll rail ─────────────────────── */
+.recalls-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.45) transparent;
+  scroll-behavior: smooth;
+}
+
+.recalls-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.recalls-scroll::-webkit-scrollbar-track {
+  margin: 8px 0;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.02) 0%,
+    rgba(34, 211, 238, 0.04) 50%,
+    rgba(255, 255, 255, 0.02) 100%
+  );
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.35);
+}
+
+.recalls-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    rgba(165, 180, 252, 0.55) 0%,
+    rgba(34, 211, 238, 0.75) 50%,
+    rgba(129, 140, 248, 0.55) 100%
+  );
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  box-shadow:
+    0 0 10px rgba(34, 211, 238, 0.35),
+    0 0 2px rgba(255, 255, 255, 0.2) inset;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.recalls-scroll::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(
+    180deg,
+    rgba(199, 210, 254, 0.8) 0%,
+    rgba(34, 211, 238, 0.95) 50%,
+    rgba(167, 139, 250, 0.8) 100%
+  );
+  background-clip: padding-box;
+  box-shadow:
+    0 0 14px rgba(34, 211, 238, 0.55),
+    0 0 4px rgba(255, 255, 255, 0.25) inset;
+}
+
+.recalls-scroll::-webkit-scrollbar-thumb:active {
+  background: linear-gradient(
+    180deg,
+    rgba(34, 211, 238, 1) 0%,
+    rgba(99, 102, 241, 0.95) 100%
+  );
+  background-clip: padding-box;
+  box-shadow: 0 0 16px rgba(34, 211, 238, 0.7);
+}
+
+.recalls-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ── Voice sensitivity slider (Settings → Voice) ──────────────────────────
+   Chromium-only app, so -webkit slider pseudo-elements are safe. The track
+   gradient fills to the live value via the inline "--fill" custom property,
+   and the thumb gets a soft glowing ring. */
+.bikli-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    90deg,
+    #06b6d4 0%,
+    #8b5cf6 var(--fill, 50%),
+    rgba(255, 255, 255, 0.08) var(--fill, 50%)
+  );
+  outline: none;
+  cursor: pointer;
+}
+.bikli-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2px solid #22d3ee;
+  box-shadow:
+    0 0 0 4px rgba(34, 211, 238, 0.18),
+    0 1px 6px rgba(0, 0, 0, 0.55);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.bikli-range:hover::-webkit-slider-thumb,
+.bikli-range:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.15);
+  box-shadow:
+    0 0 0 6px rgba(34, 211, 238, 0.24),
+    0 1px 6px rgba(0, 0, 0, 0.55);
+}
+
+/* ── Home-screen animated lighting border ─────────────────────────────────
+   A soft glowing ring around the whole screen with a bright "light" that
+   sweeps around the edges. A registered angle custom property rotates only
+   the gradient, so the border stays a clean square (no tilting) — this is
+   Chromium-only (Electron), where @property is fully supported.
+   Colors come from inline --glow-* vars, set per theme in App.tsx. */
+@property --sweep-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.border-light-sweep {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--sweep-angle),
+    var(--glow-faint, rgba(34, 211, 238, 0.16)) 0deg,
+    var(--glow-faint, rgba(34, 211, 238, 0.16)) 276deg,
+    var(--glow-bright, rgba(34, 211, 238, 0.9)) 340deg,
+    var(--glow-accent, rgba(168, 85, 247, 0.95)) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  animation: border-light-angle 8s linear infinite;
+}
+
+@keyframes border-light-angle {
+  to { --sweep-angle: 360deg; }
+}
+
+/* Same sweeping light, sized for a small card. Put this as an absolutely
+   positioned child inside a `relative` card (with matching rounding) — the
+   ring follows the card's corners and never covers its content. */
+.card-light-sweep {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--sweep-angle),
+    var(--glow-faint, rgba(251, 191, 36, 0.20)) 0deg,
+    var(--glow-faint, rgba(251, 191, 36, 0.20)) 276deg,
+    var(--glow-bright, rgba(251, 191, 36, 0.95)) 340deg,
+    var(--glow-accent, rgba(245, 158, 11, 0.95)) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  animation: border-light-angle 7s linear infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   BIKLI PREMIUM CHARACTER CARD — Apple Vision Pro / Nothing OS / Tesla /
+   Cyberpunk-HUD inspired. All motion is transform+opacity (GPU-friendly).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Glass card shell ─────────────────────────────────────────────────── */
+.bikli-card {
+  position: relative;
+  border-radius: 36px;
+  background: rgba(10, 12, 18, 0.7);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 0 70px rgba(0, 0, 0, 0.35),
+    0 0 40px rgba(0, 255, 255, 0.1),
+    0 30px 90px rgba(2, 8, 40, 0.55),
+    0 0 60px rgba(59, 130, 246, 0.12),
+    0 0 130px rgba(139, 92, 246, 0.10);
+  transform: translateZ(0);
+  transition:
+    transform 0.6s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.6s ease;
+  will-change: transform;
+}
+.bikli-card:hover {
+  transform: translateZ(0) scale(1.02);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    inset 0 0 90px rgba(0, 0, 0, 0.28),
+    0 0 60px rgba(0, 255, 255, 0.16),
+    0 45px 140px rgba(2, 8, 40, 0.7),
+    0 0 100px rgba(59, 130, 246, 0.26),
+    0 0 180px rgba(139, 92, 246, 0.20);
+}
+
+/* ── Animated neon gradient border (blue→cyan→purple→indigo, flows) ───── */
+.bikli-card-border {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: linear-gradient(
+    120deg,
+    #38bdf8 0%,
+    #22d3ee 25%,
+    #a855f7 50%,
+    #6366f1 75%,
+    #38bdf8 100%
+  );
+  background-size: 400% 400%;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  opacity: calc(0.7 + var(--vol, 0) * 0.3);
+  pointer-events: none;
+  transition: opacity 0.5s ease;
+  animation:
+    bikli-border-enter 0.9s cubic-bezier(0.22, 1, 0.36, 1) 0.15s backwards,
+    bikli-border-flow 12s ease-in-out 1.1s infinite;
+}
+.bikli-card:hover .bikli-card-border { opacity: 1; }
+@keyframes bikli-border-flow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@keyframes bikli-border-enter {
+  0% { clip-path: inset(0 0 100% 0); opacity: 0; }
+  60% { opacity: 0.95; }
+  100% { clip-path: inset(0 0 0 0); opacity: 0.7; }
+}
+
+/* ── Traveling light particle orbiting the border ─────────────────────── */
+.bikli-card-orbit {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--sweep-angle),
+    transparent 0deg,
+    transparent 288deg,
+    rgba(125, 211, 252, 0.95) 344deg,
+    rgba(167, 139, 250, 0.95) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  animation: border-light-angle 8s linear infinite;
+  opacity: 0.9;
+  pointer-events: none;
+}
+.bikli-card.bikli-audio-active .bikli-card-orbit { animation-duration: 5s; }
+
+/* ── Border glow (pulse) + audio-reactive brightness ──────────────────── */
+.bikli-card-glow {
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  box-shadow:
+    0 0 34px rgba(56, 189, 248, 0.28),
+    0 0 70px rgba(139, 92, 246, 0.16),
+    0 0 120px rgba(99, 102, 241, 0.10);
+  opacity: calc(0.4 + var(--vol, 0) * 0.6);
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+}
+.bikli-card:hover .bikli-card-glow { opacity: calc(0.6 + var(--vol, 0) * 0.6); }
+.bikli-card-glow-pulse {
+  position: absolute;
+  inset: -4px;
+  border-radius: inherit;
+  box-shadow: 0 0 50px rgba(56, 189, 248, 0.18);
+  animation: bikli-glow-pulse 4s ease-in-out infinite;
+  opacity: 0.5;
+  pointer-events: none;
+}
+@keyframes bikli-glow-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.9; }
+}
+.bikli-card.bikli-audio-active .bikli-card-glow-pulse { animation-duration: 2.4s; }
+
+/* ── Floating glass reflection (diagonal shine, every 6s) ─────────────── */
+.bikli-card-reflection {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    115deg,
+    transparent 32%,
+    rgba(255, 255, 255, 0.05) 45%,
+    rgba(255, 255, 255, 0.09) 50%,
+    rgba(255, 255, 255, 0.05) 55%,
+    transparent 68%
+  );
+  transform: translateX(-130%);
+  animation: bikli-shine 6s ease-in-out infinite;
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+@keyframes bikli-shine {
+  0% { transform: translateX(-130%); }
+  18%, 100% { transform: translateX(130%); }
+}
+
+/* ── Ambient radial glow behind character (pulse 8s) ──────────────────── */
+.bikli-ambient-glow {
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: 76%;
+  height: 76%;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: radial-gradient(
+    closest-side,
+    rgba(59, 130, 246, 0.28) 0%,
+    rgba(139, 92, 246, 0.16) 45%,
+    rgba(34, 211, 238, 0.06) 70%,
+    transparent 100%
+  );
+  animation: bikli-ambient 8s ease-in-out infinite;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+@keyframes bikli-ambient {
+  0%, 100% { opacity: 0.6; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 1; transform: translate(-50%, -50%) scale(1.06); }
+}
+
+/* ── Mouse-follow interactive glow ────────────────────────────────────── */
+.bikli-follow-glow {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(
+    520px circle at var(--mx, 50%) var(--my, 42%),
+    rgba(96, 165, 250, 0.16),
+    rgba(139, 92, 246, 0.06) 45%,
+    transparent 65%
+  );
+  opacity: 0;
+  transition: opacity 0.5s ease;
+  pointer-events: none;
+}
+.bikli-card:hover .bikli-follow-glow { opacity: 1; }
+
+/* ── Background bokeh / dust / stars (very slow, <15% opacity) ────────── */
+.bikli-bgdot {
+  position: absolute;
+  border-radius: 999px;
+  background: rgba(125, 175, 255, 0.55);
+  animation: bikli-dust 16s ease-in-out infinite;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+@keyframes bikli-dust {
+  0% { transform: translateY(24px); opacity: 0; }
+  18% { opacity: 0.13; }
+  55% { opacity: 0.05; }
+  100% { transform: translateY(-46px); opacity: 0; }
+}
+.bikli-card.bikli-audio-active .bikli-bgdot { animation-duration: 8s; }
+.bikli-bgstar {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(186, 230, 253, 0.9);
+  box-shadow: 0 0 5px rgba(56, 189, 248, 0.7);
+  animation: bikli-twinkle 4s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes bikli-twinkle {
+  0%, 100% { opacity: 0.05; transform: scale(0.6); }
+  50% { opacity: 0.16; transform: scale(1.1); }
+}
+
+/* ── Occasional sparkles near the border ──────────────────────────────── */
+.bikli-sparkle {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(147, 197, 253, 0.95);
+  box-shadow: 0 0 7px rgba(56, 189, 248, 0.85);
+  opacity: 0;
+  animation: bikli-sparkle 6s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes bikli-sparkle {
+  0%, 90%, 100% { opacity: 0; transform: scale(0.3); }
+  93% { opacity: 0.9; transform: scale(1.2); }
+  96% { opacity: 0.25; transform: scale(0.8); }
+}
+
+/* ── Cinematic character framing ─────────────────────────────────────────
+   Centers the character and guarantees top clearance so the hair never rubs
+   the card's top border (default shifts the character DOWN slightly and
+   scales it a touch, leaving generous headroom). Tunable with --frame-y
+   (translate %) and --frame-s (scale). */
+.bikli-frame {
+  transform: translateY(var(--frame-y, 5%)) scale(var(--frame-s, 0.88));
+  will-change: transform;
+}
+
+/* ── Character idle: organic floating + breathing ─────────────────────── */
+.bikli-idle {
+  animation: bikli-idle 4s ease-in-out infinite;
+  will-change: transform;
+}
+@keyframes bikli-idle {
+  0%, 100% { transform: translateY(0) scale(1); }
+  45% { transform: translateY(-6px) scale(1.01); }
+  55% { transform: translateY(-6px) scale(1.01); }
+}
+.bikli-card:hover .bikli-idle { animation-duration: 3.4s; }
+.bikli-card:hover .bikli-character-lift { transform: translateY(-6px); }
+.bikli-character-lift {
+  transform: translateY(0);
+  transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* Enter: character gently fades upward */
+.bikli-card-enter .bikli-character-enter {
+  animation: bikli-character-enter 1s cubic-bezier(0.22, 1, 0.36, 1) 0.15s both;
+}
+@keyframes bikli-character-enter {
+  0% { opacity: 0; transform: translateY(14px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Holographic platform + scanning ──────────────────────────────────── */
+.bikli-platform-wrap {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  animation: bikli-fade-in 0.8s ease 0.55s both;
+}
+.bikli-platform {
+  position: absolute;
+  left: 50%;
+  bottom: 3%;
+  transform: translateX(-50%);
+  width: 70%;
+  height: 12%;
+  border-radius: 999px;
+  background: radial-gradient(
+    ellipse at 50% 50%,
+    rgba(56, 189, 248, 0.3),
+    rgba(99, 102, 241, 0.12) 55%,
+    transparent 76%
+  );
+  box-shadow:
+    0 0 50px rgba(56, 189, 248, 0.35),
+    inset 0 0 28px rgba(56, 189, 248, 0.16);
+  opacity: 0.85;
+  animation: bikli-platform-pulse 5s ease-in-out infinite;
+}
+/* Soft floor-reflection streak beneath the character */
+.bikli-platform::after {
+  content: '';
+  position: absolute;
+  left: 10%;
+  right: 10%;
+  bottom: -3px;
+  height: 2px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.55), rgba(139, 92, 246, 0.4), transparent);
+  filter: blur(0.5px);
+}
+@keyframes bikli-platform-pulse {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+.bikli-platform-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(56, 189, 248, 0.9) 50%, transparent);
+  animation: bikli-scanline 3.4s ease-in-out infinite;
+  opacity: 0.7;
+}
+@keyframes bikli-scanline {
+  0%, 100% { transform: translateX(-70%); opacity: 0; }
+  25% { opacity: 0.9; }
+  80% { transform: translateX(70%); opacity: 0; }
+}
+
+/* ── Sonar pulses (audio active / speaking) ───────────────────────────── */
+.bikli-sonar {
+  position: absolute;
+  left: 50%;
+  bottom: 6%;
+  width: 46%;
+  aspect-ratio: 1;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  border: 1px solid rgba(56, 189, 248, 0.5);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.25);
+  opacity: 0;
+  pointer-events: none;
+}
+.bikli-card.bikli-audio-active .bikli-sonar {
+  animation: bikli-sonar 2.2s ease-out infinite;
+}
+@keyframes bikli-sonar {
+  0% { transform: translateX(-50%) scale(0.3); opacity: 0.7; }
+  100% { transform: translateX(-50%) scale(1.5); opacity: 0; }
+}
+
+/* ── Holographic rings around character feet ──────────────────────────── */
+.bikli-ring {
+  position: absolute;
+  left: 50%;
+  bottom: 5%;
+  border-radius: 999px;
+  padding: 2px;
+  opacity: 0.15;
+  transform: translateX(-50%);
+  background: conic-gradient(
+    from var(--sweep-angle),
+    transparent 0deg,
+    transparent 288deg,
+    rgba(34, 211, 238, 0.9) 346deg,
+    rgba(34, 211, 238, 0.9) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  pointer-events: none;
+}
+.bikli-card.bikli-audio-active .bikli-ring { opacity: 0.24; }
+
+/* ── Corner brackets ──────────────────────────────────────────────────── */
+.bikli-corner {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  opacity: 0.2;
+  animation: bikli-corner-glow 4s ease-in-out infinite;
+  pointer-events: none;
+}
+.bikli-corner::before,
+.bikli-corner::after {
+  content: '';
+  position: absolute;
+  background: linear-gradient(120deg, rgba(56, 189, 248, 0.95), rgba(139, 92, 246, 0.55));
+  border-radius: 2px;
+}
+.bikli-corner::before { width: 100%; height: 2px; }
+.bikli-corner::after { width: 2px; height: 100%; }
+.bikli-corner.tl { left: 12px; top: 12px; }
+.bikli-corner.tr { right: 12px; top: 12px; transform: scaleX(-1); }
+.bikli-corner.bl { left: 12px; bottom: 12px; transform: scaleY(-1); }
+.bikli-corner.br { right: 12px; bottom: 12px; transform: scale(-1); }
+@keyframes bikli-corner-glow {
+  0%, 100% { opacity: 0.14; }
+  50% { opacity: 0.32; }
+}
+
+/* ── Bottom micro LEDs (moving light left→right) ──────────────────────── */
+.bikli-leds {
+  position: absolute;
+  left: 16%;
+  right: 16%;
+  bottom: 10px;
+  height: 2px;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+}
+.bikli-leds span {
+  width: 2px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.85);
+  box-shadow: 0 0 5px rgba(56, 189, 248, 0.7);
+  animation: bikli-led 3s ease-in-out infinite;
+}
+@keyframes bikli-led {
+  0%, 100% { opacity: 0.06; transform: scaleY(0.4); }
+  50% { opacity: 0.9; transform: scaleY(1.6); }
+}
+
+/* ── Glass noise (1-2%, kills flat gradients) ─────────────────────────── */
+.bikli-noise {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  opacity: 0.02;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 160px 160px;
+}
+
+/* ── Card enter / loading sequence ────────────────────────────────────── */
+.bikli-card-enter {
+  animation: bikli-card-enter 1s cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+@keyframes bikli-card-enter {
+  0% { opacity: 0; transform: translateY(16px) scale(0.96); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.bikli-card-enter .bikli-ambient-glow { animation-delay: 0.3s; }
+
+@keyframes bikli-fade-in {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+/* ── Power-button status ring (App footer) ─────────────────────────────── */
+.bikli-status-ring {
+  position: absolute;
+  inset: -9px;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  border-top-color: rgba(56, 189, 248, 0.95);
+  border-right-color: rgba(139, 92, 246, 0.55);
+  box-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
+  animation: bikli-status-pulse 2s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes bikli-status-pulse {
+  0%, 100% { opacity: 0.45; transform: rotate(0deg) scale(1); }
+  50% { opacity: 1; transform: rotate(180deg) scale(1.05); }
+}
+.bikli-status-wave {
+  position: absolute;
+  inset: -18px;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 211, 238, 0.4);
+  opacity: 0;
+  pointer-events: none;
+}
+.bikli-status-wave.w1 { animation: bikli-wave 2.4s ease-out infinite; }
+.bikli-status-wave.w2 { animation: bikli-wave 2.4s ease-out 1.2s infinite; }
+@keyframes bikli-wave {
+  0% { transform: scale(0.6); opacity: 0.7; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+/* ── Power button: inner glowing ripple ────────────────────────────────── */
+.bikli-power-pulse {
+  position: absolute;
+  inset: -3px;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 211, 238, 0.55);
+  box-shadow: 0 0 16px rgba(34, 211, 238, 0.35);
+  animation: bikli-power-ripple 2.4s ease-out infinite;
+  pointer-events: none;
+}
+@keyframes bikli-power-ripple {
+  0% { transform: scale(0.72); opacity: 0.7; }
+  100% { transform: scale(1.5); opacity: 0; }
+}
+
+/* ── Wake-mic error badge (pill + pulsing dot + shake) ─────────────────── */
+.bikli-err-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  box-shadow: 0 0 14px rgba(239, 68, 68, 0.18);
+}
+.bikli-err-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.95);
+  animation: bikli-pulse 1.5s ease-in-out infinite;
+}
+.bikli-err-text {
+  font-size: 9px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #fca5a5;
+  animation: bikli-shake 2.4s ease-in-out infinite;
+}
+@keyframes bikli-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+@keyframes bikli-shake {
+  0%, 92%, 100% { transform: translateX(0); }
+  94% { transform: translateX(-2px); }
+  96% { transform: translateX(2px); }
+  98% { transform: translateX(-1px); }
+}
+
+/* ── Ambient floating particles (very dim background loop) ─────────────── */
+.bikli-ambient-particle {
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(56, 189, 248, 0.3);
+  opacity: 0.3;
+  animation: floatParticle 15s linear infinite;
+  pointer-events: none;
+}
+@keyframes floatParticle {
+  0% { transform: translateY(0) translateX(0); }
+  25% { transform: translateY(-30px) translateX(10px); }
+  50% { transform: translateY(-60px) translateX(-8px); }
+  75% { transform: translateY(-30px) translateX(6px); }
+  100% { transform: translateY(0) translateX(0); }
+}
+
+/* ── Character card idle float (soft, breathing) ───────────────────────── */
+.bikli-presence-float {
+  animation: bikli-presence-float 7s ease-in-out infinite;
+  will-change: transform;
+}
+@keyframes bikli-presence-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-7px); }
+}
+
+/* ── Character card animated neon border (blue → cyan → purple) ────────── */
+.bikli-card-border-anim {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: 2.5rem;
+  padding: 2px;
+  background: linear-gradient(
+    120deg,
+    #38bdf8 0%,
+    #22d3ee 25%,
+    #a855f7 50%,
+    #6366f1 75%,
+    #38bdf8 100%
+  );
+  background-size: 400% 400%;
+  animation: bikli-border-flow 10s ease-in-out infinite;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  opacity: 0.9;
+  box-shadow: 0 0 20px rgba(56, 189, 248, 0.3);
+}
+
+/* Horizontal category chips scroller */
+.recalls-tabs-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.4) transparent;
+  scroll-behavior: smooth;
+}
+
+.recalls-tabs-scroll::-webkit-scrollbar {
+  height: 5px;
+}
+
+.recalls-tabs-scroll::-webkit-scrollbar-track {
+  margin: 0 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 999px;
+}
+
+.recalls-tabs-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    90deg,
+    rgba(129, 140, 248, 0.5),
+    rgba(34, 211, 238, 0.7),
+    rgba(167, 139, 250, 0.5)
+  );
+  border-radius: 999px;
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.3);
+}
+
+.recalls-tabs-scroll::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(165, 180, 252, 0.8),
+    rgba(34, 211, 238, 0.95),
+    rgba(196, 181, 253, 0.8)
+  );
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.5);
+}
+
+/* Shared panel scroller (Settings Voice, etc.) — same glow rail as Recalls */
+.bikli-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.45) transparent;
+  scroll-behavior: smooth;
+}
+
+.bikli-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.bikli-scroll::-webkit-scrollbar-track {
+  margin: 8px 0;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.02) 0%,
+    rgba(34, 211, 238, 0.04) 50%,
+    rgba(255, 255, 255, 0.02) 100%
+  );
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.35);
+}
+
+.bikli-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    rgba(165, 180, 252, 0.55) 0%,
+    rgba(34, 211, 238, 0.75) 50%,
+    rgba(129, 140, 248, 0.55) 100%
+  );
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  box-shadow:
+    0 0 10px rgba(34, 211, 238, 0.35),
+    0 0 2px rgba(255, 255, 255, 0.2) inset;
+}
+
+.bikli-scroll::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(
+    180deg,
+    rgba(199, 210, 254, 0.8) 0%,
+    rgba(34, 211, 238, 0.95) 50%,
+    rgba(167, 139, 250, 0.8) 100%
+  );
+  background-clip: padding-box;
+  box-shadow:
+    0 0 14px rgba(34, 211, 238, 0.55),
+    0 0 4px rgba(255, 255, 255, 0.25) inset;
+}
+

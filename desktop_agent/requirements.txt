@@ -1,0 +1,33 @@
+# BIKLI Desktop Control Agent — Python dependencies
+# Install with your local Python 3.11+ interpreter, e.g.:
+#   python -m pip install -r requirements.txt
+# Then install the Playwright browser once:
+#   python -m playwright install chromium
+#
+# Or use the frozen agent (agent_dist/bikli-agent/bikli-agent.exe) which
+# embeds its own runtime and does not need a system Python install.
+#
+# NOTE: pytesseract also requires the Tesseract OCR engine to be installed
+#       on Windows (https://github.com/UB-Mannheim/tesseract/wiki). OCR tools
+#       will gracefully report "unavailable" if it is missing; all other
+#       capabilities work without it.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pyautogui==0.9.54
+playwright==1.49.1
+psutil==6.1.1
+pywin32==308
+pyperclip==1.9.0
+pytesseract==0.3.13
+Pillow==11.0.0
+pycaw==20230407
+pygetwindow==0.0.9
+Send2Trash==1.8.3
+python-multipart==0.0.20
+# Office document creation (real Word / Excel / PowerPoint files)
+python-docx==1.1.2
+openpyxl==3.1.5
+python-pptx==1.0.2
+# Best-effort NVIDIA GPU stats; optional import (graceful fallback if absent)
+nvidia-ml-py3==7.352.0

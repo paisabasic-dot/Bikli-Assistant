@@ -1,0 +1,5 @@
+- after line 213, add these 4 lines:
+    // 5b) Common greet pairs: "hey hi", "hi hey" — treat as single trigger
+    if (/\b(hey\s+hi|hi\s+hey)\b/.test(text) || /\b(hey\s+hi|hi\s+hey)\b/.test(raw)) {
+      return true;
+    }

@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output (generated — never commit)
+build-out/
+dist/
+agent_build/
+agent_dist/
+release/
+coverage/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Logs (runtime, may contain sensitive paths/keys)
+*.log
+logs/
+
+# Environment & secrets — DO NOT COMMIT
+.env*
+!.env.example
+secrets.json
+
+# Runtime / user data (created on-device)
+memories.json
+settings.json
+metadata.json
+test-data/
+
+# Local user folders (domain-specific, not project source)
+Desktop/
+Downloads/
+
+# Local Claude Code config (machine-specific)
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
