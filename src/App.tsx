@@ -74,6 +74,11 @@ export default function App() {
    *  re-arm is delayed by 2s after this to prevent mic contention when
    *  the user toggles OFF then quickly ON again. */
   const lastManualDisconnectRef = useRef<number>(0);
+  /** True when the user said "bye" and we're waiting for Bikli to speak her
+   *  farewell before closing. Prevents auto-close from racing the audio. */
+  const goodbyePendingRef = useRef<boolean>(false);
+  /** Safety-net timer: closes the app if Gemini never calls turnOffMic after bye. */
+  const goodbyeSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Sync state changes with refs to totally prevent stale closures in callbacks
   useEffect(() => {
@@ -1195,6 +1200,12 @@ export default function App() {
           modelTranscriptRef.current = "";
           setActiveEmotion("idle");
           setCharacterState("idle");
+          // Cancel any pending goodbye close timer (user may have manually disconnected)
+          if (goodbyeSafetyTimer.current) {
+            clearTimeout(goodbyeSafetyTimer.current);
+            goodbyeSafetyTimer.current = null;
+          }
+          goodbyePendingRef.current = false;
           // Re-lock PC control when the live session ends (safety)
           setComputerControlEnabled(false);
           void fetch("/api/desktop/control", {
@@ -1253,7 +1264,18 @@ export default function App() {
           const isBye =
             isGoodbyeAndClosePhrase(text) || isGoodbyeAndClosePhrase(clipped);
           if (isBye) {
-            closeApp(5000); // safety net — she normally closes sooner via the tool
+            // Mark that this is a goodbye so turnOffMic tool closes the app
+            // instead of just disconnecting the mic. Do NOT close instantly here —
+            // let Bikli speak her farewell first, then close.
+            goodbyePendingRef.current = true;
+            // Safety-net: if Gemini never calls turnOffMic within 8s, close anyway.
+            if (goodbyeSafetyTimer.current) clearTimeout(goodbyeSafetyTimer.current);
+            goodbyeSafetyTimer.current = setTimeout(() => {
+              if (goodbyePendingRef.current) {
+                goodbyePendingRef.current = false;
+                closeApp(0);
+              }
+            }, 8000);
           } else if (isMicOffPhrase(text) || isMicOffPhrase(clipped)) {
             turnOffMicNow("user transcript: " + clipped);
           }
@@ -1339,18 +1361,25 @@ export default function App() {
             });
           } else {
             // Gemini heard a clear "mic off" / "bye" and requested session end.
+            // Check both the tool-call context and the pending-goodbye flag.
             const recentUserSpeech = userTranscriptRef.current || "";
-            const isGoodbye = isGoodbyeAndClosePhrase(recentUserSpeech);
-            // GOODBYE: the model already spoke its farewell BEFORE calling this
-            // tool. Do NOT hard-disconnect here — that would cut the final audio
-            // so "goodbye" got cut off. Just close shortly so the last buffered
-            // words finish playing.
+            const isGoodbye =
+              goodbyePendingRef.current ||
+              isGoodbyeAndClosePhrase(recentUserSpeech);
             if (isGoodbye) {
-              callback({ result: "Goodbye! Closing now." });
-              closeApp(1600);
+              // Cancel the safety-net timer — we got the proper tool call.
+              if (goodbyeSafetyTimer.current) {
+                clearTimeout(goodbyeSafetyTimer.current);
+                goodbyeSafetyTimer.current = null;
+              }
+              goodbyePendingRef.current = false;
+              // Acknowledge first so Gemini can speak the farewell audio,
+              // then close after enough time for the audio to finish playing.
+              callback({ result: "Goodbye! Closing Bikli now." });
+              // 3 seconds — enough for a short farewell to finish playing.
+              closeApp(3000);
             } else {
-              // TURN OFF MIC IMMEDIATELY — prevents Gemini from generating more
-              // speech/tools after the tool response. The 900ms delay was the bug.
+              // Plain "mic off" — just end the session, don't close the app.
               turnOffMicNow("turnOffMic tool");
               callback({ result: "Microphone turned off. Live session ended." });
             }

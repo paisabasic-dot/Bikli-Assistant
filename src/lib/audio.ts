@@ -84,6 +84,10 @@ export class BikliAudioSession {
   /** Last audio chunk (base64). A byte-identical consecutive chunk is a
    *  transport re-send — replaying it would make Bikli "repeat the same words". */
   private lastAudioChunk = "";
+  /** Timestamp when Bikli started speaking her latest turn. */
+  private lastSpeakingStartTime = 0;
+  /** Timestamp of last genuine user mic energy spike above speech threshold. */
+  private lastUserSpeechTime = 0;
   
   // State Callbacks
   private onStateChange: (state: LiveState) => void;
@@ -168,6 +172,11 @@ export class BikliAudioSession {
   }
 
   private setState(state: LiveState) {
+    if (state === "speaking" && this.currentState !== "speaking") {
+      this.lastSpeakingStartTime = Date.now();
+    } else if (state !== "speaking") {
+      this.lastSpeakingStartTime = 0;
+    }
     this.currentState = state;
     this.onStateChange(state);
   }
@@ -520,6 +529,43 @@ export class BikliAudioSession {
       }
 
       const channelData = e.inputBuffer.getChannelData(0);
+
+      // RMS Energy calculation to filter out background noise & speaker bleed
+      let sum = 0;
+      for (let i = 0; i < channelData.length; i++) {
+        sum += channelData[i] * channelData[i];
+      }
+      const rms = Math.sqrt(sum / channelData.length);
+
+      // When Bikli is speaking, speaker output feeds back into the microphone.
+      // If we send speaker bleed / ambient noise to Gemini during speaking state,
+      // Gemini's server-side VAD detects incoming audio and emits "interrupted",
+      // cutting Bikli's speech off in the middle of her response.
+      //
+      // Therefore, while Bikli is speaking:
+      // 1) Suppress mic audio for the first 600ms of her turn (startup transients).
+      // 2) Require a higher RMS threshold (> 0.048) so only intentional loud user
+      //    barge-in speech is forwarded to trigger a real interruption.
+      if (this.currentState === "speaking") {
+        const timeSinceSpeechStart = Date.now() - this.lastSpeakingStartTime;
+        if (timeSinceSpeechStart < 600) {
+          return; // Ignore mic during initial speech startup
+        }
+        if (rms < 0.048) {
+          return; // Suppress speaker bleed and normal room noise while speaking
+        }
+        // User genuinely spoke loudly over Bikli to interrupt her
+        this.lastUserSpeechTime = Date.now();
+      } else {
+        // While listening: suppress pure room silence (< 0.002) to save bandwidth
+        if (rms < 0.002) {
+          return;
+        }
+        if (rms > 0.015) {
+          this.lastUserSpeechTime = Date.now();
+        }
+      }
+
       const pcmBuffer = floatTo16BitPCM(channelData);
       const base64 = base64ArrayBuffer(pcmBuffer);
       try {
@@ -963,6 +1009,17 @@ export class BikliAudioSession {
 
   // Interruption triggers: stops all active audio players immediately
   private handleInterruption() {
+    // Only accept interruption if Bikli has been speaking for > 500ms
+    // AND either the user recently spoke loudly (RMS threshold met) or speech started > 1s ago.
+    // This prevents Gemini's false-positive server interruptions from cutting off Bikli's voice.
+    const timeSpeaking = Date.now() - this.lastSpeakingStartTime;
+    const timeSinceUserSpeech = Date.now() - this.lastUserSpeechTime;
+
+    if (timeSpeaking < 500 && timeSinceUserSpeech > 1200) {
+      console.warn("[Audio] Suppressed false server interruption (Bikli just started speaking).");
+      return;
+    }
+
     console.log("[Audio] Interruption signal received; flushing play logs.");
     
     // Stop all playing nodes

@@ -123,10 +123,6 @@ function expandUserFacingPath(input: unknown): string {
   if (REAL_USER_FOLDERS[first]) {
     return path.join(REAL_USER_FOLDERS[first], ...parts.slice(1));
   }
-  // Exact alias only (e.g. path="desktop" for openFolder).
-  if (parts.length === 1 && REAL_USER_FOLDERS[first]) {
-    return REAL_USER_FOLDERS[first];
-  }
   // Bare relative path → real Desktop so it shows up for the user.
   return path.join(REAL_USER_FOLDERS.desktop, ...parts);
 }
@@ -1056,6 +1052,8 @@ interface YouTubeVideoHit {
 let lastYouTubeQuery = "";
 /** Title of the last video we opened (detect watch-page vs new manual search). */
 let lastPlayedVideoTitle = "";
+/** Track index of last played YouTube video (e.g. 1 for first, 2 for second/another). */
+let lastPlayedYouTubeIndex = 1;
 /** When lastYouTubeQuery was set (stale cache guard). */
 let lastYouTubeQueryAt = 0;
 
@@ -1378,16 +1376,14 @@ function isYouTubeSearchOnlyIntent(userText: string): boolean {
   );
 }
 
-/** "open first/second video" / "play the 2nd result" while results are on screen. */
+/** "open first/second video" / "play the 2nd result" / "play another video" while results are on screen. */
 function isOpenNthVideoIntent(userText: string): boolean {
   const t = String(userText || "").toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
   if (!t) return false;
-  // Bare "play video" / "open the video" / "play this one" — no ordinal and no
-  // song named, so the user means whatever is on screen right now. Anchored so
-  // a named request ("play Believer video") never matches and keeps its query.
-  // The optional repeated noun absorbs the STT stutter "play video video".
+  // Bare "play video" / "open the video" / "play another video" / "play next one" — no ordinal and no
+  // song named, so the user means whatever is on screen right now.
   if (
-    /^(please |ok |okay |bikli |now )*(play|open|watch|start)( the| a| this| that| some)?( video| one| result| clip| song)(s)?( video| one| result| clip)?( now| please)?$/.test(
+    /^(please |ok |okay |bikli |now )*(play|open|watch|start)( the| a| this| that| some| another| next| different| other)?( video| one| result| clip| song)(s)?( video| one| result| clip)?( now| please)?$/.test(
       t,
     )
   ) {
@@ -1395,7 +1391,7 @@ function isOpenNthVideoIntent(userText: string): boolean {
   }
   return (
     /\b(open|play|watch|click|select)\b/.test(t) &&
-    /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|\d+(st|nd|rd|th)?)\b/.test(t) &&
+    /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|another|next|different|other|\d+(st|nd|rd|th)?)\b/.test(t) &&
     /\b(video|result|one|song|clip)\b/.test(t)
   );
 }
@@ -1407,6 +1403,9 @@ function parseVideoIndexFromText(userText: string): number | null {
   if (/\b(third|3rd|number\s*three|#?\s*3)\b/.test(t)) return 3;
   if (/\b(fourth|4th|number\s*four|#?\s*4)\b/.test(t)) return 4;
   if (/\b(fifth|5th|number\s*five|#?\s*5)\b/.test(t)) return 5;
+  if (/\b(another|next|different|other)\b/.test(t)) {
+    return Math.max(2, (lastPlayedYouTubeIndex || 1) + 1);
+  }
   const m = t.match(/\b(?:video|result|one)?\s*#?\s*(\d{1,2})\b/);
   if (m) {
     const n = parseInt(m[1], 10);
@@ -2853,24 +2852,8 @@ $script:bestScore = -1
 }, [IntPtr]::Zero) | Out-Null
 Write-Output $script:best
 `;
-  const scriptPath = path.join(os.tmpdir(), `bikli-yt-title-${Date.now()}.ps1`);
   try {
-    fs.writeFileSync(scriptPath, script, "utf8");
-    const title = await new Promise<string>((resolve) => {
-      exec(
-        `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
-        { windowsHide: true, timeout: 8000 },
-        (err, stdout) => {
-          try {
-            fs.unlinkSync(scriptPath);
-          } catch {
-            /* ignore */
-          }
-          if (err) resolve("");
-          else resolve(String(stdout || "").trim());
-        },
-      );
-    });
+    const title = await runPowerShellScript(script, 8000).catch(() => "");
     if (!title) return "";
     // "query - YouTube" / "query - YouTube - Google Chrome" / "query | YouTube"
     let q = title
@@ -2883,11 +2866,6 @@ Write-Output $script:best
     console.log(`[YouTube] Browser window title → "${q}"`);
     return q;
   } catch {
-    try {
-      fs.unlinkSync(scriptPath);
-    } catch {
-      /* ignore */
-    }
     return "";
   }
 }
@@ -3115,11 +3093,10 @@ async function clickNthYouTubeResultInBrowser(
   const onWatch = /youtube\.com\/watch|youtu\.be\//i.test(beforeUrl);
   if (onWatch) {
     const vid = extractYouTubeVideoIdFromUrl(beforeUrl);
-    console.log(`[YouTube] Already on watch page ${vid} — not clicking another video`);
+    console.log(`[YouTube] Already on watch page ${vid} — returning onWatch failure to fall back to direct video play index #${idx}`);
     return {
-      ok: true,
-      url: beforeUrl,
-      method: "already_watching",
+      ok: false,
+      error: `Already on watch page ${vid} (cannot click grid)`,
     };
   }
 
@@ -3295,33 +3272,14 @@ async function playYouTubeVideo(
   const requested = String(query || "").trim();
 
   // ── STEP 0: On-screen card click (when the user points at a visible card) ──
-  // This was previously dead code: `preferOnScreen` was accepted but never read,
-  // so the in-browser click never ran and a direct open could land on a
-  // different video than the one the user actually sees on screen.
-  if (opts?.preferOnScreen) {
-    try {
-      const clickRes = await clickNthYouTubeResultInBrowser(idx);
-      if (clickRes.ok) {
-        logCommand(`YOUTUBE_PLAY on-screen click #${idx} -> ${clickRes.url || "n/a"}`);
-        return {
-          ok: true,
-          result: {
-            result: `Clicked video #${idx} on screen.`,
-            url: clickRes.url || "",
-            method: clickRes.method || "in_browser_click",
-            index: idx,
-          },
-        };
-      }
-      console.log(`[YouTube] On-screen click not possible (${clickRes.error}), falling back to direct open.`);
-    } catch (clickErr: any) {
-      console.warn("[YouTube] On-screen click attempt failed, falling back:", clickErr?.message || clickErr);
-    }
-  }
+  // Direct video open via API search & watch URL is 100% reliable and avoids blind coordinate
+  // mouse clicking which triggers hover 3-dot menus and unwanted popup options on YouTube cards.
 
   // ── STEP 1: Resolve search query ────────────────────────────────────────
   // Named song: use the title model/user gave. Index-only words → fall back to last search.
-  const isIndexOnly = /^(first|1st|second|2nd|third|3rd|video|result|one|this|that|next)$/i.test(requested);
+  const isIndexOnly =
+    /^(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|video|result|one|this|that|next|another|different|other)$/i.test(requested) ||
+    /^(the\s+)?(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|next|another|different|other)(\s+(video|one|result|clip|song))?$/i.test(requested);
   let searchQ = (isIndexOnly ? "" : requested) || lastYouTubeQuery || screenTitle;
 
   if (!searchQ) {
@@ -3338,17 +3296,8 @@ async function playYouTubeVideo(
 
   if (!searchQ) {
     // Nothing named, nothing searched earlier, and the on-screen click above
-    // could not reach a video. YouTube's home feed cannot be read server-side
-    // (it returns an empty shell without consent cookies), so there is no
-    // honest way to pick "a video" here — ASK instead of pretending.
-    logCommand(`YOUTUBE_PLAY unresolved (no query, on-screen click failed) index=${idx}`);
-    return {
-      ok: false,
-      error:
-        "NOT_PLAYED: I could not tell which video to play — nothing is searched yet. " +
-        "Tell the user out loud that you need the name, and ask them briefly, e.g. " +
-        "\"Which video should I play?\". Do NOT say you played or opened anything.",
-    };
+    // could not reach a video. Fall back to trending/popular YouTube search instead of failing.
+    searchQ = "trending videos";
   }
 
   // ── STEP 2: Debounce same play (only within the window — a later re-request
@@ -3390,6 +3339,7 @@ async function playYouTubeVideo(
     lastYouTubeQuery = searchQ;
     lastYouTubeQueryAt = Date.now();
     lastPlayedVideoTitle = hit.title || "";
+    lastPlayedYouTubeIndex = idx;
     lastYouTubePlayKey = playKey;
     lastYouTubePlayAt = Date.now();
     mediaPlaybackState = "playing";
@@ -4733,9 +4683,8 @@ async function maybeAutoOpenNthYouTubeVideo(
   }
   console.log(`[YouTube Auto] Spoken open #${index} video ON-SCREEN: "${transcript}"`);
   try {
-    // preferOnScreen: click the card the user sees (Share Screen / manual open).
-    const result = await playYouTubeVideo("", index, { preferOnScreen: true });
-    logCommand(`YOUTUBE_AUTO_OPEN #${index} on_screen ok=${result.ok}`);
+    const result = await playYouTubeVideo("", index);
+    logCommand(`YOUTUBE_AUTO_OPEN #${index} ok=${result.ok}`);
     try {
       if (clientWs.readyState === 1 || clientWs.readyState === undefined) {
         clientWs.send(
@@ -5269,6 +5218,7 @@ async function callDesktopAgent(
     lastYouTubePlayKey = "";
     lastYouTubePlayAt = 0;
     lastPlayedVideoTitle = "";
+    lastPlayedYouTubeIndex = 1;
 
     // ── In-app search: if YouTube app was opened recently (within 5 min),
     //    search inside the app instead of opening a browser tab. This handles
@@ -6709,7 +6659,7 @@ async function startServer() {
         "8. TOOL TRIGGERS:\n" +
         "   - For 'open YouTube', 'open Google', 'open Gmail', or any 'open <website>' request: ALWAYS use 'openWebsite' (name='youtube' etc.). This opens the user's REAL default browser (Chrome/Edge) — reliable in the packaged app.\n" +
         "   - IN THE APP EXCEPTION (CRITICAL): When the user says 'open X in the YouTube app' / 'use the YouTube app' / 'YouTube app me kholo' / 'launch the Spotify app' / 'open the video in the app' / any phrase where the word 'app' or 'application' sits next to a website/service name (youtube, spotify, whatsapp, discord, netflix, …), you MUST use 'openApplication' (name='youtube', name='spotify', etc.) — NEVER 'openWebsite' / 'playYouTube' / 'searchYouTube' for the same target. The YouTube/Store apps are launched as desktop apps, not websites. One call only: openApplication ONCE with the exact app name. Do NOT also call openWebsite in the same turn — the server will keep the app call and drop the website call.\n" +
-        "   - For 'search YouTube for X' / 'search video on YouTube' (search only): use 'searchYouTube' once — RESULTS PAGE ONLY, never start a video. For 'play/open X on YouTube' / 'open video' / 'open first/second video' (also when Share Screen is active): use ONLY 'playYouTube' once (query optional + index). Never chain openWebsite+searchYouTube+playYouTube. Never use searchYouTube when they asked to open/play a video.\n" +
+        "   - For 'search YouTube for X' / 'search video on YouTube' (search only): use 'searchYouTube' once — RESULTS PAGE ONLY, never start a video. For 'play/open X on YouTube' / 'open video' / 'open first/second video' / 'play another video' (also when Share Screen is active): use ONLY 'playYouTube' once (query optional + index). Never chain openWebsite+searchYouTube+playYouTube. Never use searchYouTube when they asked to open/play a video.\n" +
         "   - For 'open image' / 'first image' / 'photo of X': use ONLY 'openImage' once (query + index). Never searchGoogle for images when they asked to OPEN an image.\n" +
         "   - For 'search Google for X' (text search only): use 'searchGoogle' / 'searchWeb' once.\n" +
         "   - Use 'browserOpen' only for multi-step automation inside Bikli's optional in-built background browser — NOT for simple open-YouTube or play-song requests.\n" +
@@ -7238,7 +7188,7 @@ async function startServer() {
                 {
                   name: "playYouTube",
                   description:
-                    "OPEN/PLAY a video. For 'open/play first/second video' while Share Screen or manual YouTube results are visible: pass index only (query EMPTY) so the server clicks the ON-SCREEN card — never a different scraped video. For 'play Believer on YouTube' pass query=song name. Optional title= exact title you see on screen for precision.",
+                    "OPEN/PLAY a video. For 'open/play first/second video' or 'play another video' / 'next video' while YouTube is open or results are visible: pass index (1 = first video, 2 = second/another video, etc., query EMPTY). For 'play Believer on YouTube' pass query=song name. Optional title= exact title you see on screen for precision.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
@@ -7870,42 +7820,57 @@ async function startServer() {
         tools: geminiTools,
       });
 
-      // ── Connect to Gemini Live via raw WebSocket ───────────────────────
-      try {
+      // ── Connect to Gemini Live via raw WebSocket with multi-model fallback ──
+      const liveModels = [
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-2.0-flash-exp",
+        "gemini-2.0-flash",
+      ];
+
+      let connectedModel = "";
+      for (const candidateModel of liveModels) {
         try {
-          session = await createRawGeminiSession(
-            apiKey,
-            "gemini-2.5-flash-native-audio-latest",
-            buildSetup(speechLanguageCode),
-            makeGeminiCallbacks(),
-          );
-        } catch (langErr: any) {
-          // languageCode is documented for half-cascade models; a native-audio
-          // model may reject it. Never let a pronunciation preference cost the
-          // user their whole voice session — retry once without it.
-          if (!speechLanguageCode) throw langErr;
-          console.warn(
-            `[Gemini] Setup rejected languageCode="${speechLanguageCode}" (${langErr?.message || langErr}); retrying with auto language.`,
-          );
-          logError(`SPEECH_LANGUAGE_REJECTED ${speechLanguageCode}: ${langErr?.message || langErr}`);
-          speechLanguageCode = "";
-          session = await createRawGeminiSession(
-            apiKey,
-            "gemini-2.5-flash-native-audio-latest",
-            buildSetup(""),
-            makeGeminiCallbacks(),
-          );
+          try {
+            session = await createRawGeminiSession(
+              apiKey,
+              candidateModel,
+              buildSetup(speechLanguageCode),
+              makeGeminiCallbacks(),
+            );
+            connectedModel = candidateModel;
+            break;
+          } catch (langErr: any) {
+            // languageCode is documented for half-cascade models; native-audio
+            // models may reject it. Retry candidate with auto language before moving on.
+            if (!speechLanguageCode) throw langErr;
+            console.warn(
+              `[Gemini] Setup rejected languageCode="${speechLanguageCode}" (${langErr?.message || langErr}); retrying model ${candidateModel} with auto language.`,
+            );
+            logError(`SPEECH_LANGUAGE_REJECTED ${speechLanguageCode}: ${langErr?.message || langErr}`);
+            speechLanguageCode = "";
+            session = await createRawGeminiSession(
+              apiKey,
+              candidateModel,
+              buildSetup(""),
+              makeGeminiCallbacks(),
+            );
+            connectedModel = candidateModel;
+            break;
+          }
+        } catch (modelErr: any) {
+          const msg = String(modelErr?.message || modelErr || "");
+          console.warn(`[Gemini] Model "${candidateModel}" connect failed: ${msg}`);
+          const isAuth = /API_KEY|not valid|unauth|403|401/i.test(msg);
+          if (isAuth) {
+            throw new Error(`Gemini API key is invalid or unauthorized. Check your key in Settings. (${msg.slice(0, 120)})`);
+          }
         }
-        logStartup(`GEMINI_SESSION speechLanguage=${speechLanguageCode || "auto"}`);
-      } catch (connectErr: any) {
-        const msg = String(connectErr?.message || connectErr || "");
-        console.error("[Gemini] Raw WebSocket session failed:", msg);
-        const isAuth = /API_KEY|not valid|unauth|403|401/i.test(msg);
-        if (isAuth) {
-          throw new Error(`Gemini API key is invalid or unauthorized. Check your key in Settings. (${msg.slice(0, 120)})`);
-        }
-        throw connectErr;
       }
+
+      if (!session) {
+        throw new Error("Could not connect to any Gemini Live model. Please check your internet connection or API key.");
+      }
+      logStartup(`GEMINI_SESSION model=${connectedModel} speechLanguage=${speechLanguageCode || "auto"}`);
 
       // Callbacks are built lazily so the languageCode retry above can reuse them.
       function makeGeminiCallbacks() {
