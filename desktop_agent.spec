@@ -42,6 +42,9 @@ hiddenimports += [
     "desktop_agent.tools_system",
     "desktop_agent.tools_system_settings",
     "desktop_agent.tools_startup",
+    # generateImage — omitting it here is why frozen agents answered
+    # "Unknown tool 'generateImage'" and Bikli claimed she could not make images.
+    "desktop_agent.tools_image",
 ]
 
 # Web stack — uvicorn pulls its loop/protocol/lifespan submodules dynamically.

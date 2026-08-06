@@ -940,3 +940,28 @@
     0 0 4px rgba(255, 255, 255, 0.25) inset;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Native <select> dropdown legibility.
+ *
+ * The closed control is styled by Tailwind, but the OPEN option list is drawn
+ * by the OS, not by our dark panel. It inherits the control's colours, and the
+ * settings selects use `bg-white/5` + `text-white` — i.e. near-transparent
+ * white on white — so on Windows the microphone and voice-language entries
+ * rendered as invisible text. Declare a dark colour-scheme and give options a
+ * solid background so their labels are always readable.
+ * ------------------------------------------------------------------------ */
+select {
+  color-scheme: dark;
+}
+
+select option {
+  background-color: #0f172a; /* slate-900 */
+  color: #f1f5f9;            /* slate-100 */
+}
+
+select option:checked,
+select option:hover {
+  background-color: #1e293b; /* slate-800 */
+  color: #ffffff;
+}

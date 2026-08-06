@@ -96,6 +96,13 @@ export class BikliAudioSession {
   private onError: (error: string) => void;
   private onMemorySync?: (memories: any[]) => void;
   private onComputerControl?: (enabled: boolean, meta?: { action?: string; reason?: string }) => void;
+  private onImageStatus?: (data: {
+    status: "generating" | "completed" | "failed";
+    requestId?: string;
+    path?: string;
+    prompt?: string;
+    error?: string;
+  }) => void;
   
   private currentState: LiveState = "disconnected";
   private isActivated = false;
@@ -162,6 +169,13 @@ export class BikliAudioSession {
     onError: (error: string) => void;
     onMemorySync?: (memories: any[]) => void;
     onComputerControl?: (enabled: boolean, meta?: { action?: string; reason?: string }) => void;
+    onImageStatus?: (data: {
+      status: "generating" | "completed" | "failed";
+      requestId?: string;
+      path?: string;
+      prompt?: string;
+      error?: string;
+    }) => void;
   }) {
     this.onStateChange = handlers.onStateChange;
     this.onTranscription = handlers.onTranscription;
@@ -169,6 +183,7 @@ export class BikliAudioSession {
     this.onError = handlers.onError;
     this.onMemorySync = handlers.onMemorySync;
     this.onComputerControl = handlers.onComputerControl;
+    this.onImageStatus = handlers.onImageStatus;
   }
 
   private setState(state: LiveState) {
@@ -231,6 +246,11 @@ export class BikliAudioSession {
     if (!this.screenShareDesired) return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (this.currentState === "disconnected" || this.currentState === "connecting") return;
+    // NEVER push frames while she is answering. Frames go to Gemini as realtime
+    // input, which its activity detection treats as a new turn — a frame every
+    // 1.5s chopped "what do you see?" into speak / cut / restart / cut. Vision
+    // resumes the moment she stops, so she still sees the live camera.
+    if (this.currentState === "speaking") return;
     try {
       this.ws.send(JSON.stringify({ type: "video", video: base64Data }));
     } catch (err) {
@@ -867,6 +887,11 @@ export class BikliAudioSession {
               console.warn("[Bikli] Gemini session_closed");
               this.handleUnexpectedSessionDrop("session_closed");
             }
+            return;
+          }
+
+          if (data.type === "image_status") {
+            this.onImageStatus?.(data);
             return;
           }
 

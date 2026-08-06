@@ -31,6 +31,10 @@ import {
   OFFICE_TOOLS,
   createOfficeFileViaNode,
 } from "./server_office";
+import {
+  IMAGE_TOOLS,
+  generateImageViaNode,
+} from "./server_image";
 
 dotenv.config();
 
@@ -223,6 +227,49 @@ const logError = (m: string) => appendLog("errors.log", m);
 const DESKTOP_AGENT_URL = process.env.DESKTOP_AGENT_URL || "http://127.0.0.1:8765";
 const DESKTOP_AGENT_TIMEOUT = 4_000; // ms — fast background execution
 
+/**
+ * Per-tool timeout overrides. The 4s default is right for clicks and app
+ * launches, but a tool that waits on a remote service needs far longer —
+ * generateImage was aborted mid-download every single time (measured: 9-46s
+ * per picture), which surfaced to the user as "I can't generate images".
+ *
+ * Deliberately shorter than IMAGE_GEN_TIMEOUT_MS: if the Python agent stalls we
+ * still want budget left for the Node fallback to deliver the picture.
+ */
+const DESKTOP_AGENT_TIMEOUT_BY_TOOL: Record<string, number> = {
+  generateImage: 45_000,
+};
+const agentTimeoutFor = (tool: string): number =>
+  DESKTOP_AGENT_TIMEOUT_BY_TOOL[tool] ?? DESKTOP_AGENT_TIMEOUT;
+
+// ---------------------------------------------------------------------------
+// One picture at a time.
+//
+// A single "make an image of X" produced two or three pictures: generation
+// takes 10-46s, and while the first call is still running Gemini fires
+// generateImage again (it has had no tool result yet, so it assumes the
+// request was missed). Each extra call also restarted the on-screen animation.
+// A claim held for the duration of the run collapses that back to one image,
+// while still allowing a genuine second request once the first has finished.
+// ---------------------------------------------------------------------------
+let imageGenInFlight: { startedAt: number } | null = null;
+/** Hard ceiling — a wedged claim must never disable image generation for good. */
+const IMAGE_GEN_CLAIM_MAX_MS = 120_000;
+
+function claimImageGeneration(): boolean {
+  if (imageGenInFlight) {
+    const age = Date.now() - imageGenInFlight.startedAt;
+    if (age < IMAGE_GEN_CLAIM_MAX_MS) return false;
+    console.warn(`[Image] Stale generation claim (${age}ms) — releasing.`);
+  }
+  imageGenInFlight = { startedAt: Date.now() };
+  return true;
+}
+
+function releaseImageGeneration(): void {
+  imageGenInFlight = null;
+}
+
 // Rolling window for the per-session dialogue log used by memory extraction.
 // Without a cap, a long session re-sends the ENTIRE transcript to Gemini on
 // every turn (costly, can blow the context window) and grows memory forever.
@@ -288,6 +335,8 @@ const DESKTOP_TOOLS: ReadonlySet<string> = new Set([
   "enableAutoStart", "disableAutoStart", "getAutoStartStatus",
   // Computer control gate (control word unlocks full PC + cursor)
   "enableComputerControl", "disableComputerControl", "getComputerControlStatus",
+  // AI Image generation
+  "generateImage",
   // Cursor + keyboard (require control mode)
   "getScreenSize", "getMousePosition", "moveMouse", "clickMouse",
   "doubleClick", "rightClick", "dragMouse", "scrollMouse",
@@ -323,6 +372,10 @@ const CONTROL_ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
   "searchWeb",
   "searchGitHub",
   "openImage",
+  // Image Generation & Camera
+  "generateImage",
+  "openCamera",
+  "closeCamera",
   // Stories / notes / files — silent write, no control word, no typeText
   "createFile",
   "writeToNotepad",
@@ -1612,6 +1665,16 @@ function coalesceBrowserFunctionCalls<T extends { name?: string; args?: any; id?
     ) {
       console.log(`[Browser Coalesce] Dropping ${name} (openImage already handles direct image)`);
       continue;
+    }
+
+    // Multiple generateImage in ONE batch → keep first only. The model likes to
+    // fire "make an image" two or three times at once, which produced two or
+    // three different pictures for a single request.
+    if (name === "generateImage") {
+      if (out.some((x) => x.name === "generateImage")) {
+        console.log("[Browser Coalesce] Dropping duplicate generateImage");
+        continue;
+      }
     }
 
     // Multiple searchYouTube without play → keep first only
@@ -4765,7 +4828,7 @@ async function callDesktopAgentRaw(
   args: Record<string, unknown>,
 ): Promise<{ ok: boolean; result?: unknown; error?: string; timedOut?: boolean }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DESKTOP_AGENT_TIMEOUT);
+  const timer = setTimeout(() => controller.abort(), agentTimeoutFor(tool));
   try {
     const res = await fetch(`${DESKTOP_AGENT_URL}/execute`, {
       method: "POST",
@@ -5166,6 +5229,31 @@ async function callDesktopAgent(
     } catch (e: any) {
       logCommand(`OFFICE ${tool} (node after error: ${e?.message || e})`);
       return createOfficeFileViaNode(tool, args);
+    }
+  }
+
+  // ── AI image generation ──
+  // Prefer the Python agent, but ALWAYS fall back to Node. A frozen
+  // bikli-agent.exe built before tools_image.py existed answers
+  // "Unknown tool 'generateImage'", and Bikli then told the user she had no
+  // way to make pictures. Node can do the whole job itself, so the answer is
+  // never "I can't".
+  if (IMAGE_TOOLS.has(tool)) {
+    try {
+      const agentResult = await callDesktopAgentRaw(tool, args);
+      if (agentResult.ok) {
+        logCommand(`IMAGE ${tool} (desktop agent)`);
+        return agentResult as { ok: boolean; result?: unknown; error?: string };
+      }
+      const errText = String(agentResult.error || "");
+      logCommand(`IMAGE ${tool} (node fallback after agent: ${errText.slice(0, 120)})`);
+      const fb = await generateImageViaNode(args);
+      if (fb.ok) return fb;
+      // Both failed — report the more informative message.
+      return { ok: false, error: fb.error || errText || "Image generation failed." };
+    } catch (e: any) {
+      logCommand(`IMAGE ${tool} (node after error: ${e?.message || e})`);
+      return generateImageViaNode(args);
     }
   }
 
@@ -5777,7 +5865,7 @@ Write-Output $r.State.ToString()
   const tryOnce = async (): Promise<{ ok: boolean; result?: any; error?: string }> => {
     logCommand(`EXECUTE ${tool} ${JSON.stringify(args)}`);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), DESKTOP_AGENT_TIMEOUT);
+    const timer = setTimeout(() => controller.abort(), agentTimeoutFor(tool));
 
     const res = await fetch(`${DESKTOP_AGENT_URL}/execute`, {
       method: "POST",
@@ -6607,6 +6695,14 @@ async function startServer() {
         "- General knowledge questions (capital of France, what is X, who is Y, history, science, facts): ANSWER FROM YOUR OWN KNOWLEDGE IMMEDIATELY. Never call searchGoogle/searchWeb for facts you already know.\n" +
         "- Only call searchGoogle/searchWeb when the user EXPLICITLY says 'search', 'google it', 'find online', 'look up', 'search web for', or asks for LIVE/real-time information (news, weather, stock price, today's date).\n" +
         "- CRITICAL: 'What is the capital of France' = answer from knowledge. 'Search the web for...' = use searchGoogle.\n" +
+        "AI IMAGE GENERATION & CREATION (CRITICAL — YOU CAN GENERATE IMAGES!):\n" +
+        "- When the user asks to create, make, generate, draw, or render an image, picture, photo, artwork, or drawing (e.g. 'make an image of a car', 'generate a picture of a cat', 'draw a cyber dragon', 'create a photo of a sunset'):\n" +
+        "- You MUST IMMEDIATELY call the 'generateImage' tool with prompt= detailed text description of the requested image!\n" +
+        "- NEVER say 'I cannot generate images' or 'I don't have the ability to create pictures'. YOU HAVE FULL IMAGE GENERATION POWER via the 'generateImage' tool.\n" +
+        "- generateImage works WITHOUT the control word. It creates the AI image, saves it to the user's computer (Pictures folder), displays it on screen over your visualizer with a close button, and opens Windows Photo Viewer.\n" +
+        "- CALL generateImage EXACTLY ONCE per request (CRITICAL): one 'make an image' = ONE call = ONE picture. It takes 10-45 seconds, so you will wait a while with no result — that is NORMAL. NEVER call generateImage a second time because the first is slow, and never call it twice in one turn. Calling twice makes two different pictures and confuses the user.\n" +
+        "- While the picture is being created, stay quiet or say at most one short 'Still working on it…'. Only say it is ready AFTER the tool returns.\n" +
+        "- Confirm in one short sentence AFTER calling the tool: 'Creating your image now!'\n" +
         "SEARCH / OPEN MEDIA (CRITICAL — DIRECT OPEN):\n" +
         "- For 'search X' (web only): searchGoogle/searchWeb ONCE. System builds the correct URL — never invent links.\n" +
         "- LOCAL IMAGES / SCREENSHOTS / FILE EXPLORER (CRITICAL): For 'open first screenshot', 'open second image', 'open screenshot on desktop', 'open image named X', 'open my photo': call openLocalImage ONCE with index (1=first/newest, 2=second) and optional name= or folder='Desktop'|'Pictures'|'Screenshots'. Opens the file DIRECTLY in Photos — NEVER openFolder + searchFiles + typeText, NEVER Explorer search box, NEVER openImage (web).\n" +
@@ -7792,6 +7888,36 @@ async function startServer() {
                     required: ["text"],
                   },
                 },
+                // --- AI Image Generation & Camera App Vision ---
+                {
+                  name: "generateImage",
+                  description: "ALWAYS call this tool whenever the user asks to make, create, generate, draw, or render an image, picture, photo, or artwork (e.g. 'make an image of a car', 'generate a picture of a cat'). Generates a high quality AI image, saves it to the user's computer, shows it in-place on screen, and opens Windows Photo Viewer.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      prompt: { type: Type.STRING, description: "Detailed text description of the image to generate." },
+                      filename: { type: Type.STRING, description: "Optional filename (e.g. 'cyber_dragon.jpg')." },
+                      folder: { type: Type.STRING, description: "Destination folder ('Pictures', 'Desktop', 'Downloads'). Default is 'Pictures'." }
+                    },
+                    required: ["prompt"]
+                  }
+                },
+                {
+                  name: "openCamera",
+                  description: "Open the live Camera App overlay to see real-world images from the webcam. ONLY call when user explicitly asks to open camera, turn on camera, see through camera, or look at an object via camera.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {}
+                  }
+                },
+                {
+                  name: "closeCamera",
+                  description: "Close the Camera App overlay and stop seeing images from webcam. ONLY call when user asks to close camera, turn off camera, or stop camera.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {}
+                  }
+                },
               ]
             }
           ];
@@ -7997,7 +8123,9 @@ async function startServer() {
                     dropped.id,
                     {
                       result:
-                        "Skipped extra browser open — only one tab is opened for this play/search request.",
+                        dropped.name === "generateImage"
+                          ? "Skipped extra generateImage — ONE picture is already being created for this request. Do not ask for another."
+                          : "Skipped extra browser open — only one tab is opened for this play/search request.",
                       ok: true,
                       coalesced: true,
                     },
@@ -8082,8 +8210,82 @@ async function startServer() {
                       // Always refuse image payloads on the tool path
                       (fixedArgs as Record<string, unknown>).include_image = false;
                     }
+
+                    // Every generateImage call gets its own requestId so the UI
+                    // restarts its animation for each new picture instead of
+                    // re-using the panel that is already on screen.
+                    const imageRequestId =
+                      fc.name === "generateImage"
+                        ? `img_${Date.now()}_${Math.floor(Math.random() * 1e6)}`
+                        : "";
+
+                    // Claim BEFORE touching the UI: a duplicate must not restart
+                    // the animation or clear the picture that is still coming.
+                    let heldImageClaim = false;
+                    if (fc.name === "generateImage") {
+                      heldImageClaim = claimImageGeneration();
+                      if (!heldImageClaim) {
+                        console.log("[Image] Duplicate generateImage ignored — one already running.");
+                        logCommand("IMAGE skip duplicate generateImage (already in flight)");
+                        safeSendToolResponse(
+                          toolKey,
+                          fc.name,
+                          fc.id,
+                          {
+                            result:
+                              "An image is ALREADY being created right now. Do NOT call generateImage again " +
+                              "and do NOT say it is done. Wait quietly for the picture that is already running.",
+                            skipped: true,
+                            ok: true,
+                          },
+                          "duplicate image skipped",
+                        );
+                        return;
+                      }
+                      try {
+                        clientWs.send(
+                          JSON.stringify({
+                            type: "image_status",
+                            status: "generating",
+                            requestId: imageRequestId,
+                            prompt: (fixedArgs as any)?.prompt || "AI Image",
+                          }),
+                        );
+                      } catch {
+                        /* ignore */
+                      }
+                    }
+
                     console.log(`[Desktop Agent] Routing ${fc.name} to Python backend...`, fixedArgs);
-                    const agentResult = await callDesktopAgent(fc.name, fixedArgs, recentUserSpeech);
+                    let agentResult: { ok: boolean; result?: unknown; error?: string };
+                    try {
+                      agentResult = await callDesktopAgent(fc.name, fixedArgs, recentUserSpeech);
+                    } finally {
+                      // Release even if the call threw, so one bad run cannot
+                      // block every later image.
+                      if (heldImageClaim) releaseImageGeneration();
+                    }
+
+                    if (fc.name === "generateImage") {
+                      const resObj = (agentResult.result || {}) as Record<string, unknown>;
+                      const succeeded = agentResult.ok && Boolean(resObj.path);
+                      try {
+                        clientWs.send(
+                          JSON.stringify({
+                            type: "image_status",
+                            // A failure MUST be reported too — otherwise the
+                            // spinner span forever with no image behind it.
+                            status: succeeded ? "completed" : "failed",
+                            requestId: imageRequestId,
+                            path: resObj.path || "",
+                            prompt: resObj.prompt || (fixedArgs as any)?.prompt || "AI Image",
+                            error: succeeded ? "" : agentResult.error || "Image generation failed.",
+                          }),
+                        );
+                      } catch {
+                        /* ignore */
+                      }
+                    }
 
                     // Push control-mode badge updates to the React UI.
                     if (
@@ -8405,6 +8607,20 @@ async function startServer() {
 
   // Serve custom static assets folder (use APP_ROOT so packaged cwd is fine)
   app.use("/assets", express.static(path.join(APP_ROOT, "assets")));
+
+  // Endpoint to safely serve local image files to the frontend UI
+  app.get("/api/local-image", (req, res) => {
+    try {
+      const imgPath = String(req.query.path || "").trim();
+      if (!imgPath || !fs.existsSync(imgPath)) {
+        res.status(404).send("File not found");
+        return;
+      }
+      res.sendFile(path.resolve(imgPath));
+    } catch (err: any) {
+      res.status(500).send("Error serving file");
+    }
+  });
 
   // Express Static assets / Vite Dev Middleware configuration
   if (process.env.NODE_ENV !== "production") {

@@ -13,6 +13,7 @@ import {
   X,
   Brain,
   Monitor,
+  Camera,
   Play,
   Pause,
   Square,
@@ -23,6 +24,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { Memory, MemoryCategory } from "./lib/memoryTypes";
 import { MemoryDashboard } from "./components/MemoryDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { CameraModal } from "./components/CameraModal";
 import { BikliSettings, loadSettings, saveSettings } from "./lib/settingsStore";
 import { BikliWakeWordDetector, WakeWordState } from "./lib/wakeWord";
 
@@ -49,12 +51,42 @@ export default function App() {
   // Live PIP preview stream (React state so the <video> re-binds reliably)
   const [screenPreviewStream, setScreenPreviewStream] = useState<MediaStream | null>(null);
 
+  // Camera App & Vision states — STRICT: frames flow ONLY while camera app is open
+  const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
+  const [isCameraVisionActive, setIsCameraVisionActive] = useState<boolean>(true);
+
+  // AI Image generation in-place preview state (shown in place of Bikli character visualizer)
+  const [isGeneratingImage, setIsGeneratingImage] = useState<boolean>(false);
+  const [imageGeneratingPrompt, setImageGeneratingPrompt] = useState<string>("");
+  const [generatedImagePreview, setGeneratedImagePreview] = useState<
+    { path: string; prompt: string; nonce: number } | null
+  >(null);
+  // Bumped on every generateImage request so the panel remounts and replays its
+  // animation for each new picture instead of silently swapping the old one.
+  const [imageRequestNonce, setImageRequestNonce] = useState<number>(0);
+  const [imageError, setImageError] = useState<string | null>(null);
+
   // References to preserve state across intervals
   const screenStreamRef = useRef<MediaStream | null>(null);
   const screenVideoRef = useRef<HTMLVideoElement | null>(null);
   const screenPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
   const screenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const screenIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cameraIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isCameraActiveRef = useRef<boolean>(false);
+  const isCameraVisionRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    isCameraActiveRef.current = isCameraActive;
+  }, [isCameraActive]);
+
+  useEffect(() => {
+    isCameraVisionRef.current = isCameraVisionActive;
+  }, [isCameraVisionActive]);
   // Re-entrancy guard for startScreenSharing: two concurrent invocations would
   // both tear down, then each acquire a display stream, and the later one would
   // overwrite screenStreamRef, leaking the earlier stream (never stopped).
@@ -219,6 +251,117 @@ export default function App() {
       sessionRef.current?.sendVideoFrame(base64);
     } catch (err) {
       console.error("[Screen Capture] Failed drawing frame to canvas:", err);
+    }
+  };
+
+  /**
+   * STRICT Camera Vision Frame Capture — ONLY runs while the Camera App is OPEN.
+   */
+  const captureCameraFrameAndSend = () => {
+    const video = cameraVideoRef.current;
+    if (!isCameraActiveRef.current || !video || !isCameraVisionRef.current) return;
+    if (stateRef.current === "disconnected" || stateRef.current === "connecting") return;
+
+    try {
+      if (video.videoWidth === 0 || video.videoHeight === 0 || video.readyState < 1) return;
+
+      if (!cameraCanvasRef.current) {
+        cameraCanvasRef.current = document.createElement("canvas");
+      }
+      const canvas = cameraCanvasRef.current;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+
+      const maxDim = 1024;
+      let width = video.videoWidth;
+      let height = video.videoHeight;
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+      }
+
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+
+      ctx.drawImage(video, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.65);
+      const base64 = dataUrl.split(",")[1];
+      if (!base64 || base64.length < 100) return;
+
+      sessionRef.current?.sendVideoFrame(base64);
+    } catch (err) {
+      console.error("[Camera Vision] Failed to capture frame:", err);
+    }
+  };
+
+  /** Open Camera App & start camera vision stream */
+  const startCameraVision = async () => {
+    if (isCameraActiveRef.current) return;
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Camera API is not available in this environment.");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+
+      cameraStreamRef.current = stream;
+      setIsCameraActive(true);
+      isCameraActiveRef.current = true;
+
+      // Attach stream once modal renders
+      setTimeout(() => {
+        if (cameraVideoRef.current) {
+          cameraVideoRef.current.srcObject = stream;
+          void cameraVideoRef.current.play().catch(() => {});
+        }
+      }, 150);
+
+      // Start frame capture interval (1.5s)
+      if (cameraIntervalRef.current) clearInterval(cameraIntervalRef.current);
+      cameraIntervalRef.current = setInterval(() => {
+        captureCameraFrameAndSend();
+      }, 1500);
+
+      // Notify live session to accept vision frames
+      sessionRef.current?.setScreenShareActive(true);
+      sessionRef.current?.flushScreenShareState();
+    } catch (err: any) {
+      console.error("[Camera App] getUserMedia failed:", err);
+      throw new Error(`Failed to open camera: ${err.message || err}`);
+    }
+  };
+
+  /** Stop Camera App & kill webcam hardware tracks completely */
+  const stopCameraVision = () => {
+    if (cameraIntervalRef.current) {
+      clearInterval(cameraIntervalRef.current);
+      cameraIntervalRef.current = null;
+    }
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((track) => {
+        try { track.stop(); } catch {}
+      });
+      cameraStreamRef.current = null;
+    }
+    if (cameraVideoRef.current) {
+      try {
+        cameraVideoRef.current.pause();
+        cameraVideoRef.current.srcObject = null;
+      } catch {}
+    }
+    setIsCameraActive(false);
+    isCameraActiveRef.current = false;
+    if (!isScreenSharingRef.current) {
+      sessionRef.current?.setScreenShareActive(false);
     }
   };
 
@@ -1239,6 +1382,33 @@ export default function App() {
           setCharacterState("idle");
         }
       },
+      onImageStatus: (data) => {
+        if (data.status === "generating") {
+          // Clear the previous picture first — each request makes a NEW one,
+          // and the nonce restarts the animation even for back-to-back asks.
+          setGeneratedImagePreview(null);
+          setImageError(null);
+          setImageRequestNonce((n) => n + 1);
+          setIsGeneratingImage(true);
+          setImageGeneratingPrompt(data.prompt || "Creating AI Image...");
+        } else if (data.status === "completed") {
+          setIsGeneratingImage(false);
+          if (data.path) {
+            setGeneratedImagePreview({
+              path: data.path,
+              prompt: data.prompt || "AI Image",
+              // Cache-buster: without it the browser re-shows the previous
+              // picture whenever a filename is reused.
+              nonce: Date.now(),
+            });
+          }
+        } else if (data.status === "failed") {
+          // Never leave the spinner running forever on a failure.
+          setIsGeneratingImage(false);
+          setGeneratedImagePreview(null);
+          setImageError(data.error || "Image generation failed.");
+        }
+      },
       onTranscription: (role, text) => {
         if (role === "user") {
           const prev = userTranscriptRef.current;
@@ -1279,6 +1449,16 @@ export default function App() {
           } else if (isMicOffPhrase(text) || isMicOffPhrase(clipped)) {
             turnOffMicNow("user transcript: " + clipped);
           }
+
+          // Spoken request to close AI image preview ("close image", "hide picture", "dismiss")
+          if (
+            /\b(close|hide|dismiss|remove)\s+(the\s+)?(image|picture|photo|preview|art|artwork)\b/i.test(clipped) ||
+            /^(close|hide)\s+(image|picture)$/i.test(clipped.trim())
+          ) {
+            setGeneratedImagePreview(null);
+            setIsGeneratingImage(false);
+          }
+
           // Control word → unlock/lock full PC + cursor (server also does this)
           const ctrl = detectControlPhraseLocal(text) || detectControlPhraseLocal(clipped);
           if (ctrl === "enable") {
@@ -1339,6 +1519,13 @@ export default function App() {
               setBrowserTrigger(null);
             },
           });
+        } else if (name === "openCamera") {
+          startCameraVision()
+            .then(() => callback({ result: "Camera App opened. Bikli live vision active on camera feed." }))
+            .catch((err) => callback({ error: `Could not open camera: ${err.message || err}` }));
+        } else if (name === "closeCamera") {
+          stopCameraVision();
+          callback({ result: "Camera App closed. Camera vision stream stopped." });
         } else if (name === "changeBackground") {
           const colorName = args.color?.toLowerCase();
           const validColors = ["violet", "crimson", "emerald", "celestial", "gold", "rose", "charcoal"];
@@ -1792,6 +1979,115 @@ export default function App() {
         />
       </div>
 
+      {/* SIDE-ALIGNED AI IMAGE PROCESSING & CREATED IMAGE PREVIEW (Positioned on the RIGHT SIDE so Bikli's face is NEVER blocked) */}
+      {/* Keyed children: AnimatePresence can only run the enter/exit animation
+          when each branch carries a stable key, and the nonce in the key makes
+          a brand-new panel animate in for every fresh request. */}
+      <AnimatePresence mode="wait">
+        {isGeneratingImage && (
+          <div key={`img-gen-${imageRequestNonce}`} className="absolute top-24 right-8 z-40 pointer-events-none">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.85, x: 30 }}
+              animate={{ opacity: 1, scale: 1, x: 0 }}
+              exit={{ opacity: 0, scale: 0.85, x: 30 }}
+              transition={{ duration: 0.25, ease: "easeOut" }}
+              className="pointer-events-auto flex flex-col items-center gap-3 rounded-2xl border border-cyan-500/30 bg-slate-950/85 p-5 shadow-2xl shadow-cyan-950/60 backdrop-blur-xl w-72 text-center"
+            >
+              <div className="relative flex h-12 w-12 items-center justify-center rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-400">
+                <RefreshCw className="h-6 w-6 animate-spin text-cyan-400" />
+                <span className="absolute inset-0 rounded-full border-2 border-cyan-400/40 animate-ping" />
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-slate-100">Generating AI Image...</h4>
+                {imageGeneratingPrompt && (
+                  <p className="mt-1 text-xs text-slate-400 italic line-clamp-2">
+                    {imageGeneratingPrompt}
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5 text-[10px] font-mono text-cyan-400/80 uppercase tracking-wider">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                Creating & Saving to PC
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {!isGeneratingImage && generatedImagePreview && (
+          <div
+            key={`img-done-${generatedImagePreview.nonce}`}
+            className="absolute top-24 right-8 z-40 pointer-events-none"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, x: 30 }}
+              animate={{ opacity: 1, scale: 1, x: 0 }}
+              exit={{ opacity: 0, scale: 0.9, x: 30 }}
+              transition={{ duration: 0.25, ease: "easeOut" }}
+              className="pointer-events-auto relative flex flex-col items-center rounded-2xl border border-cyan-500/40 bg-slate-950/90 p-4 shadow-2xl shadow-cyan-950/80 backdrop-blur-2xl w-80 sm:w-96"
+            >
+              {/* Header with Title & Close Button */}
+              <div className="flex w-full items-center justify-between pb-2 border-b border-cyan-500/20 mb-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-xs font-semibold text-slate-200">Generated AI Image</span>
+                </div>
+                <button
+                  onClick={() => setGeneratedImagePreview(null)}
+                  className="rounded-full bg-white/10 p-1.5 text-slate-300 hover:bg-red-500/30 hover:text-red-200 transition-colors cursor-pointer"
+                  title="Close Image (or say 'close image')"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              {/* The Image */}
+              <div className="relative w-full overflow-hidden rounded-xl bg-black/60 border border-white/10 flex items-center justify-center">
+                <img
+                  key={generatedImagePreview.nonce}
+                  src={`/api/local-image?path=${encodeURIComponent(generatedImagePreview.path)}&v=${generatedImagePreview.nonce}`}
+                  alt={generatedImagePreview.prompt}
+                  className="max-h-[260px] w-auto max-w-full object-contain rounded-lg shadow-lg"
+                />
+              </div>
+
+              {/* Caption & Info */}
+              <div className="mt-2.5 flex w-full items-center justify-between text-xs text-slate-400">
+                <span className="truncate max-w-[200px] text-slate-300 italic" title={generatedImagePreview.prompt}>
+                  {generatedImagePreview.prompt}
+                </span>
+                <span className="text-[10px] font-mono text-emerald-400/90 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                  Saved in Pictures
+                </span>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {!isGeneratingImage && !generatedImagePreview && imageError && (
+          <div key="img-error" className="absolute top-24 right-8 z-40 pointer-events-none">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, x: 30 }}
+              animate={{ opacity: 1, scale: 1, x: 0 }}
+              exit={{ opacity: 0, scale: 0.9, x: 30 }}
+              transition={{ duration: 0.25, ease: "easeOut" }}
+              className="pointer-events-auto flex w-72 flex-col items-center gap-2 rounded-2xl border border-red-500/30 bg-slate-950/85 p-4 text-center shadow-2xl shadow-red-950/40 backdrop-blur-xl"
+            >
+              <div className="flex w-full items-center justify-between">
+                <span className="text-xs font-semibold text-red-200">Image failed</span>
+                <button
+                  onClick={() => setImageError(null)}
+                  className="cursor-pointer rounded-full bg-white/10 p-1 text-slate-300 transition-colors hover:bg-red-500/30 hover:text-red-200"
+                  title="Dismiss"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              <p className="text-xs text-slate-400 line-clamp-3">{imageError}</p>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* HEADER SECTION - Minimalist typography */}
       <header className="relative z-30 flex items-center justify-between w-full max-w-5xl mx-auto select-none">
         <div className="flex items-center gap-2">
@@ -1872,6 +2168,20 @@ export default function App() {
           >
             <Monitor size={14} className={isScreenSharing && !isScreenSharingPaused ? "animate-pulse text-cyan-400" : ""} />
             <span>{isScreenSharing ? "SHARING" : "SHARE SCREEN"}</span>
+          </button>
+
+          {/* Camera App button (Bikli Camera Vision) */}
+          <button
+            onClick={isCameraActive ? stopCameraVision : startCameraVision}
+            className={`flex items-center gap-1.5 transition text-xs font-mono tracking-widest cursor-pointer ${
+              isCameraActive
+                ? "text-emerald-400 opacity-100 font-semibold"
+                : "opacity-25 hover:opacity-100 text-white"
+            }`}
+            title="Open Camera App (Bikli Vision)"
+          >
+            <Camera size={14} className={isCameraActive ? "animate-pulse text-emerald-400" : ""} />
+            <span>{isCameraActive ? "CAMERA ON" : "CAMERA"}</span>
           </button>
 
           {/* V2: Settings toggler button — matches existing faint-to-hover header style */}
@@ -2258,6 +2568,15 @@ export default function App() {
         settings={settings}
         onChange={handleSettingsChange}
         themeColor={themeColor}
+      />
+
+      {/* Camera App & Live Vision Modal */}
+      <CameraModal
+        isOpen={isCameraActive}
+        onClose={stopCameraVision}
+        videoRef={cameraVideoRef}
+        isVisionActive={isCameraVisionActive}
+        onToggleVision={() => setIsCameraVisionActive(!isCameraVisionActive)}
       />
     </div>
   );

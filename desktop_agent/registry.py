@@ -182,6 +182,10 @@ DESKTOP_TOOL_NAMES = [
     "enableComputerControl",
     "disableComputerControl",
     "getComputerControlStatus",
+    # AI generation & Camera Vision
+    "generateImage",
+    "openCamera",
+    "closeCamera",
     # Cursor + keyboard (require control mode)
     "getScreenSize",
     "getMousePosition",
@@ -228,6 +232,10 @@ CONTROL_ALWAYS_ALLOWED = frozenset(
         "searchWeb",
         "searchGitHub",
         "openImage",
+        # Image Generation & Camera
+        "generateImage",
+        "openCamera",
+        "closeCamera",
         # Write notes/stories + read files without control word (no keyboard typing)
         "createFile",
         "writeToNotepad",
@@ -278,6 +286,7 @@ _MODULE_NAMES = [
     "tools_system_settings",
     "tools_startup",
     "tools_cursor",
+    "tools_image",
 ]
 
 
