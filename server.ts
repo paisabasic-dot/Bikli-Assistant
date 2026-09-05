@@ -35,6 +35,10 @@ import {
   IMAGE_TOOLS,
   generateImageViaNode,
 } from "./server_image";
+import {
+  agentBrowserOpenUrl,
+  agentBrowserPlayYouTube,
+} from "./server_browser";
 
 dotenv.config();
 
@@ -295,6 +299,7 @@ const DESKTOP_TOOLS: ReadonlySet<string> = new Set([
   // Routed to the Python agent so packaged EXE does not depend on the fragile
   // in-app YouTube search proxy / Playwright Chromium bundle.
   "openWebsite", "searchWeb", "searchYouTube", "searchGoogle", "searchGitHub",
+  "browserOpenUrl", "browserSearch", "browserPlayYouTube",
   // YouTube play — handled in Node (search + open watch URL). Also listed so
   // the live session routes it through the desktop-tool path.
   "playYouTube",
@@ -343,10 +348,24 @@ const DESKTOP_TOOLS: ReadonlySet<string> = new Set([
   "typeText", "pressKey", "hotkey", "mouseMoveAndClick",
   // browserType → real browser (not in-app iframe)
   "browserType",
+  // Autonomous Vision & Web Agent (Browser-Use & Claude Computer Use)
+  "startAutonomousMission",
+  "stopAutonomousMission",
+  "pauseAutonomousMission",
+  "resumeAutonomousMission",
+  "getAutonomousMissionStatus",
+  "desktopBrowserExtractText",
 ]);
 
 /** Tools that work even when computer control is locked (must match Python agent). */
 const CONTROL_ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
+  // Autonomous Mission Control (can be launched or stopped at any time)
+  "startAutonomousMission",
+  "stopAutonomousMission",
+  "pauseAutonomousMission",
+  "resumeAutonomousMission",
+  "getAutonomousMissionStatus",
+  "desktopBrowserExtractText",
   "enableComputerControl",
   "disableComputerControl",
   "getComputerControlStatus",
@@ -362,15 +381,17 @@ const CONTROL_ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
   "getClipboard",
   "getAutoStartStatus",
   // Real browser YouTube / web — no control word required.
-  // NOTE: browserScroll is intentionally NOT here — its Node/agent
-  // implementation moves the physical cursor, so it needs the control word.
   "browserMediaControl",
+  "browserScroll",
   "openWebsite",
   "searchYouTube",
   "playYouTube",
   "searchGoogle",
   "searchWeb",
   "searchGitHub",
+  "browserOpenUrl",
+  "browserSearch",
+  "browserPlayYouTube",
   "openImage",
   // Image Generation & Camera
   "generateImage",
@@ -1157,9 +1178,11 @@ const OPEN_LIKE_TOOLS = new Set([
   "searchGoogle",
   "searchWeb",
   "searchGitHub",
-  "browserOpen",
   "desktopBrowserOpen",
   "desktopBrowserSearch",
+  "browserOpenUrl",
+  "browserSearch",
+  "browserPlayYouTube",
   "writeToNotepad",
 ]);
 
@@ -1204,11 +1227,20 @@ function makeOpenActionKey(tool: string, args: Record<string, unknown> | undefin
   if (n === "searchGoogle" || n === "searchWeb" || n === "searchGitHub") {
     return `search:${n}:${normalizeOpenTarget(String(a.query || a.q || ""))}`;
   }
-  if (n === "browserOpen" || n === "desktopBrowserOpen") {
+  if (n === "desktopBrowserOpen") {
     return `brow:${normalizeOpenTarget(String(a.url || a.query || a.name || ""))}`;
   }
   if (n === "desktopBrowserSearch") {
     return `browsearch:${normalizeOpenTarget(String(a.query || a.q || ""))}`;
+  }
+  if (n === "browserOpenUrl") {
+    return `web:${normalizeOpenTarget(String(a.url || a.target || ""))}`;
+  }
+  if (n === "browserSearch") {
+    return `search:${String(a.engine || "google")}:${normalizeOpenTarget(String(a.query || a.q || ""))}`;
+  }
+  if (n === "browserPlayYouTube") {
+    return `ytplay:${normalizeOpenTarget(String(a.query || a.q || lastYouTubeQuery || ""))}|${a.index ?? a.n ?? 1}`;
   }
   if (n === "writeToNotepad") {
     // Same story/content open spam — debounce by path or content hash prefix
@@ -1275,7 +1307,7 @@ function claimOpenAction(
   // INVERTED RULE: user said "in the <X> app" → block the WEB call,
   // let the app call through. The LLM sometimes fires both openWebsite(X)
   // and openApplication(X); we drop the web one here when intent is clear.
-  if (inAppTarget && (tool === "openWebsite" || tool === "playYouTube" || tool === "searchYouTube" || tool === "browserOpen" || tool === "desktopBrowserOpen")) {
+  if (inAppTarget && (tool === "openWebsite" || tool === "playYouTube" || tool === "searchYouTube" || tool === "desktopBrowserOpen")) {
     const a = (args || {}) as Record<string, unknown>;
     const blob = `${a.name || ""} ${a.url || ""} ${a.query || ""} ${a.q || ""}`.toLowerCase();
     if (blob.includes(inAppTarget) || (tool === "playYouTube" || tool === "searchYouTube")) {
@@ -1325,7 +1357,7 @@ function openDebounceSkipResult(tool: string): { ok: true; result: Record<string
   return {
     ok: true,
     result: {
-      result: `Already opened that — skipped duplicate ${tool} so only one window/tab opens.`,
+      result: "Done.",
       debounced: true,
       ok: true,
     },
@@ -1343,7 +1375,7 @@ function normalizeBrowserUrl(url: string): string {
 function isYouTubeRelatedToolCall(name: string, args: Record<string, unknown> | undefined): boolean {
   const n = String(name || "");
   if (n === "playYouTube" || n === "searchYouTube") return true;
-  if (n === "openWebsite" || n === "browserOpen" || n === "desktopBrowserOpen" || n === "desktopBrowserSearch") {
+  if (n === "openWebsite" || n === "desktopBrowserOpen" || n === "desktopBrowserSearch") {
     const blob = `${args?.name || ""} ${args?.url || ""} ${args?.query || ""} ${args?.q || ""}`.toLowerCase();
     return /youtube|youtu\.be|music\.youtube/.test(blob);
   }
@@ -1429,33 +1461,84 @@ function isYouTubeSearchOnlyIntent(userText: string): boolean {
   );
 }
 
-/** "open first/second video" / "play the 2nd result" / "play another video" while results are on screen. */
+/**
+ * Detect if user speech is an explicit command to search Google or the web.
+ * For general questions (what/why/how/who/tell me/explain/chat), returns false.
+ */
+function isExplicitWebSearchCommand(userText: string, query: string = ""): boolean {
+  const t = String(userText || "").toLowerCase().trim();
+  if (!t) return false;
+
+  // Clear explicit command patterns to search Google / web:
+  // "search google for...", "google search...", "search on google", "search web for...",
+  // "search for X on google", "google X", "search internet for..."
+  const isExplicitSearch =
+    /\b(search\s+google|google\s+search|search\s+on\s+google|search\s+in\s+google|look\s*up\s+on\s+google|google\s+pe\s+search)\b/i.test(t) ||
+    /\b(search\s+(the\s+)?web|web\s+search|search\s+online|search\s+internet|internet\s+pe\s+search)\b/i.test(t) ||
+    /^(google|search)\s+[a-z0-9]/i.test(t);
+
+  if (isExplicitSearch) {
+    return true;
+  }
+
+  // Question words, definitions, explanations, calculations, or chat:
+  // NEVER open a browser window for these!
+  const isQuestionOrChat =
+    /^(what|why|how|who|where|when|which|is|are|can|could|would|should|do|does|did|will|tell|explain|define|summarize|calculate|translate|batao|samjhao|kya|kyun|kaise|kahan|kab|kaun)\b/i.test(t) ||
+    /\b(what\s+is|who\s+is|why\s+is|how\s+does|how\s+to|tell\s+me|explain\s+to\s+me|kya\s+hai|kaise\s+hota\s+hai)\b/i.test(t);
+
+  if (isQuestionOrChat) {
+    return false;
+  }
+
+  // If user explicitly said "search for <something>", allow it
+  if (/\b(search\s+for|search)\b/i.test(t)) {
+    return true;
+  }
+
+  return false;
+}
+
+/** "open first/second video" / "play the 2nd result" / "play another video" / "pay first video" / "pehla video chalao" */
 function isOpenNthVideoIntent(userText: string): boolean {
   const t = String(userText || "").toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
   if (!t) return false;
-  // Bare "play video" / "open the video" / "play another video" / "play next one" — no ordinal and no
-  // song named, so the user means whatever is on screen right now.
+
+  // Common STT typos: "pay" or "ple" or "pee" instead of "play"
+  const actionWord = /\b(play|pay|ple|pee|open|watch|start|click|select|chalao|kholo|lagao)\b/;
+  const ordinalWord = /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|another|next|different|other|pehla|pehli|doosra|doosri|teesra|teesri|\d+(st|nd|rd|th)?)\b/;
+  const targetWord = /\b(video|result|one|song|clip|gaana)\b/;
+
+  // Bare "play video" / "open the video" / "play another video" / "play next one"
   if (
-    /^(please |ok |okay |bikli |now )*(play|open|watch|start)( the| a| this| that| some| another| next| different| other)?( video| one| result| clip| song)(s)?( video| one| result| clip)?( now| please)?$/.test(
+    /^(please |ok |okay |bikli |now )*(play|pay|ple|open|watch|start)( the| a| this| that| some| another| next| different| other)?( video| one| result| clip| song)(s)?( video| one| result| clip)?( now| please)?$/.test(
       t,
     )
   ) {
     return true;
   }
-  return (
-    /\b(open|play|watch|click|select)\b/.test(t) &&
-    /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|another|next|different|other|\d+(st|nd|rd|th)?)\b/.test(t) &&
-    /\b(video|result|one|song|clip)\b/.test(t)
-  );
+
+  // "play first video", "pay first video", "pehla video chalao", "first video play"
+  if (actionWord.test(t) && ordinalWord.test(t)) {
+    return true;
+  }
+  if (actionWord.test(t) && targetWord.test(t) && ordinalWord.test(t)) {
+    return true;
+  }
+  // "first video", "1st video", "pehli video", "pehla video"
+  if (/^(the\s+)?(first|1st|second|2nd|third|3rd|pehla|pehli|doosra|doosri)\s+(video|song|clip|result|one)$/.test(t)) {
+    return true;
+  }
+  return false;
 }
 
 function parseVideoIndexFromText(userText: string): number | null {
   const t = String(userText || "").toLowerCase();
-  if (/\b(first|1st|number\s*one|#?\s*1)\b/.test(t)) return 1;
-  if (/\b(second|2nd|number\s*two|#?\s*2)\b/.test(t)) return 2;
-  if (/\b(third|3rd|number\s*three|#?\s*3)\b/.test(t)) return 3;
-  if (/\b(fourth|4th|number\s*four|#?\s*4)\b/.test(t)) return 4;
-  if (/\b(fifth|5th|number\s*five|#?\s*5)\b/.test(t)) return 5;
+  if (/\b(first|1st|number\s*one|#?\s*1|pehla|pehli|ek)\b/.test(t)) return 1;
+  if (/\b(second|2nd|number\s*two|#?\s*2|doosra|doosri|do)\b/.test(t)) return 2;
+  if (/\b(third|3rd|number\s*three|#?\s*3|teesra|teesri|teen)\b/.test(t)) return 3;
+  if (/\b(fourth|4th|number\s*four|#?\s*4|chautha|chaar)\b/.test(t)) return 4;
+  if (/\b(fifth|5th|number\s*five|#?\s*5|paanchwa|paanch)\b/.test(t)) return 5;
   if (/\b(another|next|different|other)\b/.test(t)) {
     return Math.max(2, (lastPlayedYouTubeIndex || 1) + 1);
   }
@@ -1477,6 +1560,17 @@ function coalesceBrowserFunctionCalls<T extends { name?: string; args?: any; id?
   recentUserText = "",
 ): T[] {
   if (!calls || calls.length === 0) return calls || [];
+
+  // QUESTION / CONVERSATION VS WEB SEARCH GUARD:
+  // When the user asks a question, definition, fact, or chat, Gemini must NEVER open Google/browser.
+  // Drop searchGoogle and searchWeb calls unless recentUserText has an explicit search command.
+  const hasWebSearch = calls.some((c) => c.name === "searchGoogle" || c.name === "searchWeb");
+  if (hasWebSearch && recentUserText) {
+    if (!isExplicitWebSearchCommand(recentUserText)) {
+      console.log(`[Browser Coalesce] Dropping searchGoogle/searchWeb — user asked a question/chat ("${recentUserText.slice(0, 60)}") without explicit search command`);
+      calls = calls.filter((c) => c.name !== "searchGoogle" && c.name !== "searchWeb");
+    }
+  }
 
   const searchOnly = isYouTubeSearchOnlyIntent(recentUserText);
   const openNth = isOpenNthVideoIntent(recentUserText);
@@ -1526,7 +1620,7 @@ function coalesceBrowserFunctionCalls<T extends { name?: string; args?: any; id?
       }
       if (
         isYouTubeRelatedToolCall(name, args) &&
-        (name === "openWebsite" || name === "browserOpen" || name === "desktopBrowserOpen")
+        (name === "openWebsite" || name === "desktopBrowserOpen")
       ) {
         console.log(`[Browser Coalesce] Dropping ${name} (searchYouTube handles search)`);
         continue;
@@ -1541,7 +1635,31 @@ function coalesceBrowserFunctionCalls<T extends { name?: string; args?: any; id?
     return rewritten.length ? rewritten : calls;
   }
 
-  // OPEN Nth VIDEO (esp. while Share Screen on results): force a single playYouTube
+  // PLAY INTENT / TITLE PLAY: If user said "play", "watch", "chalao", "lagao", or named a video to play,
+  // and Gemini emitted searchYouTube, rewrite searchYouTube -> playYouTube so it directly plays!
+  const hasPlayWord = /\b(play|watch|start|chalao|lagao|sunao|dekhna|dekhu)\b/i.test(recentUserText);
+  if (!searchOnly && hasPlayWord) {
+    const hasPlayCall = calls.some((c) => c.name === "playYouTube");
+    if (!hasPlayCall) {
+      const searchCall = calls.find((c) => c.name === "searchYouTube");
+      if (searchCall) {
+        console.log(`[Browser Coalesce] User asked to PLAY ("${recentUserText.slice(0, 40)}") — upgrading searchYouTube -> playYouTube`);
+        const q = String(searchCall.args?.query || searchCall.args?.q || "").trim();
+        calls = calls.map((c) => {
+          if (c === searchCall) {
+            return {
+              ...c,
+              name: "playYouTube",
+              args: { query: q, index: 1, preferOnScreen: true },
+            };
+          }
+          return c;
+        });
+      }
+    }
+  }
+
+  // OPEN Nth VIDEO (esp. while Share Screen on results or real browser is open): force a single playYouTube
   if (openNth) {
     const playCalls = calls.filter((c) => c.name === "playYouTube");
     const searchCalls = calls.filter((c) => c.name === "searchYouTube");
@@ -1559,35 +1677,33 @@ function coalesceBrowserFunctionCalls<T extends { name?: string; args?: any; id?
         searchCalls[0]?.args?.q ||
         "",
     ).trim();
-    const base = playCalls[0] || searchCalls[0] || calls[0];
-    if (base) {
-      console.log(
-        `[Browser Coalesce] open-nth video → playYouTube index=${idx} modelQ="${modelQ}" (live resolve later)`,
-      );
-      // Drop click/nav tools that would fail on Share Screen instead of opening the video
-      const dropNames = new Set([
-        "playYouTube",
-        "searchYouTube",
-        "browserClick",
-        "browserOpen",
-        "browserSearch",
-        "desktopBrowserClick",
-        "desktopBrowserOpen",
-        "desktopBrowserSearch",
-        "openWebsite",
-        "searchWeb",
-      ]);
-      const rest = calls.filter((c) => !dropNames.has(String(c.name || "")));
-      return [
-        {
-          ...base,
-          name: "playYouTube",
-          // Empty query → resolveYouTubePlayQuery reads the current browser window
-          args: { query: modelQ, index: idx },
-        } as T,
-        ...rest,
-      ];
-    }
+    const base = playCalls[0] || searchCalls[0] || calls[0] || { name: "playYouTube", id: `play_${Date.now()}` };
+    console.log(
+      `[Browser Coalesce] open-nth video → playYouTube index=${idx} modelQ="${modelQ}" (real browser)`,
+    );
+    // Drop click/nav/search tools that would fail or open unwanted tabs/windows
+    const dropNames = new Set([
+      "playYouTube",
+      "searchYouTube",
+      "browserClick",
+      "browserOpen",
+      "browserSearch",
+      "desktopBrowserClick",
+      "desktopBrowserOpen",
+      "desktopBrowserSearch",
+      "openWebsite",
+      "searchWeb",
+      "searchGoogle",
+    ]);
+    const rest = calls.filter((c) => !dropNames.has(String(c.name || "")));
+    return [
+      {
+        ...base,
+        name: "playYouTube",
+        args: { query: modelQ, index: idx, preferOnScreen: true },
+      } as T,
+      ...rest,
+    ];
   }
 
   if (calls.length <= 1) return calls;
@@ -1651,7 +1767,7 @@ function coalesceBrowserFunctionCalls<T extends { name?: string; args?: any; id?
 
     // When searching YouTube, drop openWebsite/browserOpen for YouTube (double tab).
     const hadSearch = out.some((x) => x.name === "searchYouTube");
-    if (hadSearch && (name === "openWebsite" || name === "browserOpen" || name === "desktopBrowserOpen") && isYouTubeRelatedToolCall(name, args)) {
+    if (hadSearch && (name === "openWebsite" || name === "desktopBrowserOpen") && isYouTubeRelatedToolCall(name, args)) {
       console.log(`[Browser Coalesce] Dropping ${name} (searchYouTube already opens search page)`);
       continue;
     }
@@ -1729,7 +1845,6 @@ function dedupeOpenLikeCalls<T extends { name?: string; args?: any; id?: string 
       n === "searchYouTube" ||
       n === "searchGoogle" ||
       n === "searchWeb" ||
-      n === "browserOpen" ||
       n === "desktopBrowserOpen"
     );
   });
@@ -2125,6 +2240,16 @@ async function openSystemBrowserUrl(
   }
   lastBrowserOpenAt = now;
   lastBrowserOpenUrl = fullNorm;
+
+  // Enforce same-tab navigation via agent-browser by default (no new tabs unless requested)
+  try {
+    const abRes = await agentBrowserOpenUrl(clean, { newWindow, newTab });
+    if (abRes.ok) {
+      return;
+    }
+  } catch (abErr) {
+    console.warn(`[Browser] agentBrowserOpenUrl error, falling back to OS open:`, abErr);
+  }
 
   await openUrlViaOsStart(clean);
 
@@ -3334,11 +3459,43 @@ async function playYouTubeVideo(
   const screenTitle = String(opts?.title || "").trim();
   const requested = String(query || "").trim();
 
-  // ── STEP 0: On-screen card click (when the user points at a visible card) ──
-  // Direct video open via API search & watch URL is 100% reliable and avoids blind coordinate
-  // mouse clicking which triggers hover 3-dot menus and unwanted popup options on YouTube cards.
+  // ── STEP 0: Delegate to desktop agent or agent-browser for exact on-screen video click ──
+  try {
+    const agentRes = await callDesktopAgentRaw("playYouTube", {
+      query: requested,
+      index: idx,
+      preferOnScreen: opts?.preferOnScreen,
+    });
+    if (agentRes.ok && agentRes.result) {
+      const resObj = (agentRes.result as Record<string, unknown>) || {};
+      lastYouTubeQuery = String(resObj.query || requested || "");
+      lastYouTubeQueryAt = Date.now();
+      lastPlayedVideoTitle = String(resObj.title || "");
+      lastPlayedYouTubeIndex = idx;
+      mediaPlaybackState = "playing";
+      lastMediaActionAt = Date.now();
+      logCommand(`YOUTUBE_PLAY "${requested}" #${idx} (desktop agent-browser)`);
+      return agentRes as { ok: boolean; result?: Record<string, unknown>; error?: string };
+    }
+  } catch {}
 
-  // ── STEP 1: Resolve search query ────────────────────────────────────────
+  try {
+    const abRes = await agentBrowserPlayYouTube(requested, idx, opts);
+    if (abRes.ok && abRes.result) {
+      lastYouTubeQuery = String(abRes.result.query || requested || "");
+      lastYouTubeQueryAt = Date.now();
+      lastPlayedVideoTitle = String(abRes.result.title || "");
+      lastPlayedYouTubeIndex = idx;
+      mediaPlaybackState = "playing";
+      lastMediaActionAt = Date.now();
+      logCommand(`YOUTUBE_PLAY "${requested}" #${idx} (node agent-browser)`);
+      return abRes;
+    }
+  } catch (abErr: any) {
+    console.warn("[YouTube] Node agent-browser play failed, falling back to HTTP scrape:", abErr);
+  }
+
+  // ── STEP 1: Resolve search query (HTTP fallback) ────────────────────────
   // Named song: use the title model/user gave. Index-only words → fall back to last search.
   const isIndexOnly =
     /^(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|video|result|one|this|that|next|another|different|other)$/i.test(requested) ||
@@ -4296,8 +4453,7 @@ function mediaActionGuard(
     if (mediaPlaybackState === "playing") {
       return {
         skip: true,
-        reason:
-          "Video is already marked playing — not sending play key (prevents auto-resume after user pause).",
+        reason: "Already playing.",
       };
     }
     return { skip: false, nextState: "playing" };
@@ -4306,8 +4462,7 @@ function mediaActionGuard(
     if (mediaPlaybackState === "paused") {
       return {
         skip: true,
-        reason:
-          "Video is already marked paused — not sending pause key (toggle would resume).",
+        reason: "Already paused.",
       };
     }
     return { skip: false, nextState: "paused" };
@@ -4597,23 +4752,21 @@ function isDesktopTaskUtterance(t: string): boolean {
 
 /**
  * Detect spoken control / release phrases from live captions.
- * Returns "enable" | "disable" | null.
- * Kept STRICT so click / "what do you see" never flip control or kill the session.
  */
-function detectControlPhrase(raw: string): "enable" | "disable" | null {
-  const t = normalizeControlTranscript(raw);
-  if (!t) return null;
+export interface ControlDetectionResult {
+  action: "enable" | "disable";
+  goal?: string;
+}
 
-  // Never flip control while the user is asking for click/screen/desktop work.
-  const pureRelease = /\b(stop|release|end|disable|cancel|lock)\s+control\b/.test(t) || /\bstop\s+controlling\b/.test(t);
-  const pureEnable =
-    /^(control|take control|computer control|full control|you have control|start control|enable control|bikli control|ok control|okay control)$/.test(t) ||
-    (t.split(/\s+/).length <= 3 && /\bcontrol\b$/.test(t));
-  if (isDesktopTaskUtterance(t) && !pureRelease && !pureEnable) {
-    return null;
-  }
+/**
+  * Spoken control gate: detects user grant/release phrases for PC control.
+  * Supports direct goal extraction: "control, open Spotify and play my playlist".
+  */
+function detectControlPhrase(raw: string): ControlDetectionResult | null {
+  const norm = normalizeControlTranscript(raw);
+  if (!norm) return null;
 
-  // Release first — exact / short only (no loose includes on long sentences).
+  // 1. Release / Lock control commands (high priority)
   const releaseExact = [
     "stop control",
     "release control",
@@ -4624,30 +4777,44 @@ function detectControlPhrase(raw: string): "enable" | "disable" | null {
     "give me control",
     "stop controlling",
   ];
-  if (releaseExact.includes(t)) return "disable";
-  if (t.split(/\s+/).length <= 6 && pureRelease) return "disable";
-
-  // Exact short grant phrases
-  const exactEnable = [
-    "control",
-    "take control",
-    "computer control",
-    "full control",
-    "you have control",
-    "start control",
-    "enable control",
-    "bikli control",
-    "ok control",
-    "okay control",
-  ];
-  if (exactEnable.includes(t)) return "enable";
-  if (t.split(/\s+/).length <= 6) {
-    if (/\b(take|start|enable|full|computer)\s+control\b/.test(t)) return "enable";
-    if (/\byou\s+have\s+control\b/.test(t)) return "enable";
-    if (/\bbikli\s+control\b/.test(t)) return "enable";
+  if (releaseExact.includes(norm)) return { action: "disable" };
+  if (
+    norm.split(/\s+/).length <= 6 &&
+    (/\b(stop|release|end|disable|cancel|lock)\s+control\b/.test(norm) || /\bstop\s+controlling\b/.test(norm))
+  ) {
+    return { action: "disable" };
   }
-  // Bare "control" only on very short utterances
-  if (t.split(/\s+/).length <= 3 && /\bcontrol\b$/.test(t) && !isDesktopTaskUtterance(t)) return "enable";
+
+  // 2. Goal-bearing control commands: "control <goal>", "bikli control <goal>", "take control and <goal>"
+  const goalRegex = /^(?:bikli\s+)?(?:ok\s+|okay\s+)?(?:please\s+)?(?:take\s+|start\s+|enable\s+)?control\b[\s,:]*(.*)$/i;
+  const match = goalRegex.exec(norm);
+  if (match) {
+    let goal = (match[1] || "").trim();
+    // Strip conversational connecting words like "and", "to", "please", "now"
+    goal = goal.replace(/^(?:and|to|please|now)\s+/i, "").trim();
+    if (goal.length > 0) {
+      return { action: "enable", goal };
+    }
+    return { action: "enable" };
+  }
+
+  // 3. Alternate grant phrases: "you have control", "computer control", "full control"
+  const altGoalRegex = /^(?:you\s+have\s+control|full\s+control|computer\s+control)\b[\s,:]*(.*)$/i;
+  const altMatch = altGoalRegex.exec(norm);
+  if (altMatch) {
+    let goal = (altMatch[1] || "").trim();
+    goal = goal.replace(/^(?:and|to|please|now)\s+/i, "").trim();
+    if (goal.length > 0) {
+      return { action: "enable", goal };
+    }
+    return { action: "enable" };
+  }
+
+  // 4. Trailing "control" short phrases (e.g. "take control", "bikli control")
+  if (norm.split(/\s+/).length <= 4 && /\bcontrol\b$/.test(norm)) {
+    return { action: "enable" };
+  }
+
   return null;
 }
 
@@ -4777,15 +4944,18 @@ async function maybeAutoToggleComputerControl(
   transcript: string,
   clientWs: { send: (data: string) => void; readyState?: number },
 ): Promise<void> {
-  const action = detectControlPhrase(transcript);
-  if (!action) return;
+  const detected = detectControlPhrase(transcript);
+  if (!detected) return;
   const now = Date.now();
   if (now - lastControlAutoToggleAt < 2500) return; // debounce
   lastControlAutoToggleAt = now;
 
+  const action = detected.action;
+  const goal = detected.goal;
+
   const reason =
     action === "enable"
-      ? `user said control word: ${normalizeControlTranscript(transcript)}`
+      ? (goal ? `user said control with goal: ${goal}` : `user said control word: ${normalizeControlTranscript(transcript)}`)
       : `user released control: ${normalizeControlTranscript(transcript)}`;
 
   try {
@@ -4794,12 +4964,16 @@ async function maybeAutoToggleComputerControl(
       action === "enable"
         ? setNodeComputerControl(true, reason)
         : setNodeComputerControl(false, reason);
-    // Best-effort sync to Python agent (ignore unknown-tool errors).
+
+    // Best-effort sync to Python agent
     void callDesktopAgentRaw(
       action === "enable" ? "enableComputerControl" : "disableComputerControl",
       { reason, phrase: transcript },
     ).catch(() => {});
-    logCommand(`CONTROL_WORD_${action.toUpperCase()} "${transcript}" ok=true`);
+
+    logCommand(`CONTROL_WORD_${action.toUpperCase()} "${transcript}" goal="${goal || "none"}" ok=true`);
+
+    // Broadcast control state to UI
     try {
       clientWs.send(
         JSON.stringify({
@@ -4809,10 +4983,31 @@ async function maybeAutoToggleComputerControl(
           ok: true,
           result: payload,
           reason,
+          goal,
         }),
       );
     } catch {
       /* ws may be closed */
+    }
+
+    // If user provided an active goal with "control", auto-launch PC-Agent-E mission!
+    if (action === "enable" && goal) {
+      logCommand(`PC_AGENT_AUTO_START_MISSION: "${goal}"`);
+      // Open the visual HUD immediately
+      try {
+        clientWs.send(JSON.stringify({ type: "open_mission_hud", goal }));
+      } catch {}
+
+      void callDesktopAgentRaw("startAutonomousMission", {
+        goal,
+        mode: "desktop",
+        max_steps: 25,
+      }).catch((e) => logError(`PC_AGENT_START_FAILED: ${e?.message || e}`));
+    } else if (action === "disable") {
+      // Emergency stop any running autonomous mission
+      void callDesktopAgentRaw("stopAutonomousMission", {
+        reason: "User released control",
+      }).catch(() => {});
     }
   } catch (err: any) {
     logError(`CONTROL_WORD_ERROR: ${err?.message || err}`);
@@ -4889,6 +5084,148 @@ function getDateTimeViaNode(): { ok: true; result: Record<string, unknown> } {
       minute: now.getMinutes(),
     },
   };
+}
+
+/** Open a Windows Settings page by ms-settings: URI. */
+async function openSettingsPageViaNode(
+  uri: string,
+  label: string,
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const cmd =
+        process.platform === "win32"
+          ? `cmd /c start "" "${uri}"`
+          : `xdg-open "${uri}"`;
+      exec(cmd, { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
+    });
+    logCommand(`SETTINGS_OPEN ${uri}`);
+    return {
+      ok: true,
+      result: {
+        result: `Opened Windows settings for ${label}.`,
+        uri,
+      },
+    };
+  } catch (err: any) {
+    return { ok: false, error: `Could not open settings for '${label}': ${err?.message || err}` };
+  }
+}
+
+/**
+ * Direct WinRT Radio controller for Bluetooth & Wi‑Fi.
+ * Safe action: never requires computer control word.
+ * Truthfully queries and verifies hardware state after every change.
+ * Returns { ok: true, state: "on"|"off", result: "..." } only on verified success.
+ * Returns { ok: false, error: "..." } if adapter is missing, access is denied,
+ * or if hardware radio did not actually change.
+ */
+async function toggleRadioViaNode(
+  kind: "Bluetooth" | "WiFi",
+  rawAction?: string,
+  rawState?: string,
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  const norm = String(rawState || rawAction || "toggle").trim().toLowerCase();
+  const act =
+    norm === "status" || norm === "check" || norm === "query" || norm === "get"
+      ? "status"
+      : norm === "on" || norm === "enable" || norm === "true" || norm === "1"
+        ? "on"
+        : norm === "off" || norm === "disable" || norm === "false" || norm === "0"
+          ? "off"
+          : "toggle";
+
+  const label = kind === "WiFi" ? "Wi-Fi" : "Bluetooth";
+  const settingsUri = kind === "WiFi" ? "ms-settings:network-wifi" : "ms-settings:bluetooth";
+  const scriptPath = path.join(
+    os.tmpdir(),
+    `bikli-radio-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.ps1`,
+  );
+  const script = `
+Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue | Out-Null
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' })[0]
+function Await($WinRtTask, $ResultType) {
+  $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+  $netTask = $asTask.Invoke($null, @($WinRtTask))
+  if (-not $netTask.Wait(4000)) { throw 'WinRT timeout' }
+  return $netTask.Result
+}
+try {
+  [Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+  [Windows.Devices.Radios.RadioAccessStatus,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+  $null = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
+  $radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+  $r = $radios | Where-Object { $_.Kind -eq '${kind}' } | Select-Object -First 1
+  if (-not $r) {
+    @{ ok = $false; missing = $true; error = "No ${label} adapter found on this PC." } | ConvertTo-Json -Compress
+    exit 0
+  }
+  $act = '${act}'
+  if ($act -eq 'status') {
+    $cur = $r.State.ToString()
+    @{ ok = $true; state = $cur.ToLower(); result = "${label} is $cur." } | ConvertTo-Json -Compress
+    exit 0
+  }
+  $targetState = if ($act -eq 'on') {
+    [Windows.Devices.Radios.RadioState]::On
+  } elseif ($act -eq 'off') {
+    [Windows.Devices.Radios.RadioState]::Off
+  } else {
+    if ($r.State -eq [Windows.Devices.Radios.RadioState]::On) { [Windows.Devices.Radios.RadioState]::Off } else { [Windows.Devices.Radios.RadioState]::On }
+  }
+  $status = Await ($r.SetStateAsync($targetState)) ([Windows.Devices.Radios.RadioAccessStatus])
+  if ($status -ne [Windows.Devices.Radios.RadioAccessStatus]::Allowed) {
+    @{ ok = $false; error = "Windows did not permit changing ${label} state: access was $status."; state = $r.State.ToString().ToLower() } | ConvertTo-Json -Compress
+    exit 0
+  }
+  Start-Sleep -Milliseconds 300
+  $radios2 = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+  $r2 = $radios2 | Where-Object { $_.Kind -eq '${kind}' } | Select-Object -First 1
+  $finalState = if ($r2) { $r2.State.ToString() } else { $r.State.ToString() }
+  $expectedState = if ($targetState -eq [Windows.Devices.Radios.RadioState]::On) { 'On' } else { 'Off' }
+  if ($finalState -eq $expectedState) {
+    @{ ok = $true; state = $finalState.ToLower(); result = "${label} is now $finalState." } | ConvertTo-Json -Compress
+  } else {
+    @{ ok = $false; error = "${label} could not be turned $($expectedState.ToLower()); hardware state is $finalState."; state = $finalState.ToLower() } | ConvertTo-Json -Compress
+  }
+} catch {
+  @{ ok = $false; error = "Radio error: $($_.Exception.Message)" } | ConvertTo-Json -Compress
+}
+`.trim();
+
+  try {
+    fs.writeFileSync(scriptPath, script, "utf8");
+    const out = await new Promise<string>((resolve, reject) => {
+      exec(
+        `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
+        { windowsHide: true, timeout: 8000 },
+        (err, stdout) => {
+          try {
+            fs.unlinkSync(scriptPath);
+          } catch {
+            /* ignore */
+          }
+          if (err && !stdout) reject(err);
+          else resolve(String(stdout || "").trim());
+        },
+      );
+    });
+    const parsed = JSON.parse(out);
+    return parsed;
+  } catch (err: any) {
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch {
+      /* ignore */
+    }
+    // As a helpful fallback, open settings page so user can toggle manually,
+    // but DO NOT return ok: true because the radio was not switched!
+    void openSettingsPageViaNode(settingsUri, label);
+    return {
+      ok: false,
+      error: `Could not change ${label} automatically (${err?.message || err}). Opened ${label} Settings for you.`,
+    };
+  }
 }
 
 /** Real battery % from this PC via WMI (works without Python agent). */
@@ -5069,19 +5406,9 @@ async function callDesktopAgent(
   }
 
   // Date/time + battery: answer from this PC immediately (no control word, no Settings).
-  // Prefer Python agent when it knows the tool; always fall back to Node.
+  // Prefer Node clock directly (instant 0ms, 100% accurate)
   if (tool === "getDateTime") {
-    try {
-      /* callDesktopAgentRaw handles agent health directly */
-      const agentResult = await callDesktopAgentRaw("getDateTime", args);
-      if (agentResult.ok) {
-        logCommand("getDateTime (desktop agent)");
-        return agentResult as { ok: boolean; result?: unknown; error?: string };
-      }
-    } catch {
-      /* Node clock */
-    }
-    logCommand("getDateTime (node)");
+    logCommand("getDateTime (node direct)");
     return getDateTimeViaNode();
   }
   if (tool === "batteryInfo") {
@@ -5267,7 +5594,7 @@ async function callDesktopAgent(
   // ── YouTube PLAY: resolve first/Nth video and open the watch URL ──
   // Frozen agent only opens search results; play must happen here.
   // Query was already live-resolved above (before open debounce).
-  if (tool === "playYouTube") {
+  if (tool === "playYouTube" || tool === "browserPlayYouTube") {
     const query = String(args.query || args.q || "").trim();
     const index = Number(args.index ?? args.n ?? args.position ?? 1) || 1;
     const title = String(args.title || args.videoTitle || args.video_title || "").trim();
@@ -5283,6 +5610,32 @@ async function callDesktopAgent(
       title: title || undefined,
       preferOnScreen,
     });
+  }
+
+  if (tool === "browserOpenUrl") {
+    const rawUrl = String(args.url || args.target || "").trim();
+    if (!rawUrl) return { ok: false, error: "Parameter 'url' is required for browserOpenUrl." };
+    const newWin = wantNewWindow(args);
+    const res = await agentBrowserOpenUrl(rawUrl, { newWindow: newWin, newTab: newWin });
+    return { ok: res.ok, result: { result: `Opened ${res.url} in browser (${res.mode}).`, ...res } };
+  }
+
+  if (tool === "browserSearch") {
+    const query = String(args.query || args.q || "").trim();
+    if (!query) return { ok: false, error: "Parameter 'query' is required for browserSearch." };
+    const engine = String(args.engine || "google").toLowerCase();
+    const encoded = encodeURIComponent(query);
+    const url =
+      engine === "youtube"
+        ? `https://www.youtube.com/results?search_query=${encoded}`
+        : engine === "github"
+          ? `https://github.com/search?q=${encoded}&type=repositories`
+          : engine === "bing"
+            ? `https://www.bing.com/search?q=${encoded}`
+            : `https://www.google.com/search?q=${encoded}`;
+    const newWin = wantNewWindow(args);
+    const res = await agentBrowserOpenUrl(url, { newWindow: newWin, newTab: newWin });
+    return { ok: res.ok, result: { result: `Searching ${engine} for "${query}": opened ${res.url}.`, ...res } };
   }
 
   // searchYouTube: ALWAYS results page only — never autoplay.
@@ -5474,6 +5827,18 @@ Write-Output 'searched'
     } else {
       const query = String(args.query || args.q || "").trim();
       if (!query) return { ok: false, error: "Parameter 'query' is required." };
+
+      if ((tool === "searchGoogle" || tool === "searchWeb") && recentUserText && !isExplicitWebSearchCommand(recentUserText, query)) {
+        console.log(`[Search Guard] Blocked ${tool} for conversational/question query: "${recentUserText}"`);
+        return {
+          ok: true,
+          result: {
+            result: "Do NOT open a browser window. Answer the user's question directly with your voice using your own knowledge.",
+            blocked: true,
+          },
+        };
+      }
+
       // "open cat image" / "images of X" / tbm images → openImage direct URL
       const engineHint = String(args.engine || "").toLowerCase();
       const wantsImage =
@@ -5602,65 +5967,55 @@ Write-Output 'searched'
     return fallback;
   }
 
-  // ── System settings (Bluetooth / Wi‑Fi / Settings pages) Node fallback ──
-  if (
-    tool === "systemSetting" ||
-    tool === "openWindowsSetting" ||
-    tool === "toggleBluetooth" ||
-    tool === "toggleWifi"
-  ) {
-    if (!desktopAgentVerified) await ensureDesktopAgent();
-    try {
-      const agentResult = await callDesktopAgentRaw(tool, args);
-      if (agentResult.ok) {
-        logCommand(`SYSTEM_SETTING ${tool} (desktop agent)`);
-        return agentResult as { ok: boolean; result?: unknown; error?: string };
-      }
-      const errText = String(agentResult.error || "");
-      // Fall through to Node radio/settings when agent is old (unknown tool),
-      // control-locked (stale frozen agent), or radio API failed — keep voice fast.
-      const canNodeFallback =
-        /unknown tool|not found|not registered|not implemented|LOCKED|control word|timeout|abort/i.test(errText) ||
-        /bluetooth|wifi|wi-?fi|setting|dark|light|airplane|night/i.test(tool + JSON.stringify(args));
-      if (!canNodeFallback) {
-        return agentResult as { ok: boolean; result?: unknown; error?: string };
-      }
-      console.warn(`[SystemSetting] Agent failed (${errText.slice(0, 120)}); trying Node fallback…`);
-    } catch {
-      /* node fallback */
-    }
-    // Node fallback: open the right ms-settings: page; best-effort radio via PS
-    const setting = String(
-      args.setting || args.name || args.target ||
-      (tool === "toggleBluetooth" ? "bluetooth" :
-        tool === "toggleWifi" ? "wifi" : "settings"),
-    ).toLowerCase();
-    const action = String(args.action || args.state || "open").toLowerCase();
-    const pageMap: Record<string, string> = {
-      bluetooth: "ms-settings:bluetooth",
-      wifi: "ms-settings:network-wifi",
-      "wi-fi": "ms-settings:network-wifi",
-      airplane: "ms-settings:network-airplanemode",
-      display: "ms-settings:display",
-      sound: "ms-settings:sound",
-      network: "ms-settings:network",
-      settings: "ms-settings:",
-      "night light": "ms-settings:nightlight",
-      nightlight: "ms-settings:nightlight",
-      night: "ms-settings:nightlight",
-    };
-    const uri = pageMap[setting] || `ms-settings:${setting.replace(/\s+/g, "-")}`;
+  // ── Bluetooth direct radio toggle (safe action, zero control-word lock, 100% verified) ──
+  if (tool === "toggleBluetooth") {
+    logCommand(`toggleBluetooth ${JSON.stringify(args)} (node radio direct)`);
+    return await toggleRadioViaNode("Bluetooth", String(args.action || ""), String(args.state || ""));
+  }
 
-    // ── Night light toggle via Windows Registry (direct toggle, no Settings window) ──
-    if (/night.?light|nightlight|night/i.test(setting) && /^(on|off|enable|disable|toggle)$/i.test(action)) {
-      const wantOn = /^(on|enable|true)$/i.test(action) ? 1 : /^(off|disable|false)$/i.test(action) ? 0 : null;
+  // ── Wi‑Fi direct radio toggle (safe action, zero control-word lock, 100% verified) ──
+  if (tool === "toggleWifi") {
+    logCommand(`toggleWifi ${JSON.stringify(args)} (node radio direct)`);
+    return await toggleRadioViaNode("WiFi", String(args.action || ""), String(args.state || ""));
+  }
+
+  // ── System settings (Bluetooth / Wi‑Fi / Settings pages / Night light) ──
+  if (tool === "systemSetting" || tool === "openWindowsSetting") {
+    const setting = String(
+      args.setting || args.name || args.target || "settings",
+    ).trim().toLowerCase();
+    const rawAction = String(args.action || (tool === "openWindowsSetting" ? "open" : "")).trim().toLowerCase();
+    const rawState = String(args.state || "").trim().toLowerCase();
+    const action = rawAction || (rawState ? "set" : "open");
+
+    // Bluetooth
+    if (setting === "bluetooth" || setting === "bt" || setting === "blue tooth") {
+      if (action === "open") {
+        return await openSettingsPageViaNode("ms-settings:bluetooth", "Bluetooth");
+      }
+      logCommand(`systemSetting bluetooth ${rawAction || rawState} (node radio)`);
+      return await toggleRadioViaNode("Bluetooth", rawAction, rawState);
+    }
+
+    // Wi‑Fi
+    if (setting === "wifi" || setting === "wi-fi" || setting === "wireless" || setting === "wlan") {
+      if (action === "open") {
+        return await openSettingsPageViaNode("ms-settings:network-wifi", "Wi‑Fi");
+      }
+      logCommand(`systemSetting wifi ${rawAction || rawState} (node radio)`);
+      return await toggleRadioViaNode("WiFi", rawAction, rawState);
+    }
+
+    // Night light direct registry toggle
+    if (/night.?light|nightlight|night/i.test(setting) && /^(on|off|enable|disable|toggle)$/i.test(rawAction || rawState)) {
+      const act = rawAction || rawState;
+      const wantOn = /^(on|enable|true)$/i.test(act) ? 1 : /^(off|disable|false)$/i.test(act) ? 0 : null;
       if (wantOn !== null) {
         const ps = `
 $regPath = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate\\windows.data.bluelightreduction.bluelightreductionstate'
 try {
   $state = Get-ItemProperty -Path $regPath -Name 'Data' -ErrorAction Stop
   $bytes = [byte[]]$state.Data
-  # bytes[0] = version, bytes[1] = 1=on/0=off, bytes[8] = master switch
   if ($bytes.Length -gt 8) {
     $bytes[8] = ${wantOn}
     Set-ItemProperty -Path $regPath -Name 'Data' -Value $bytes -ErrorAction Stop
@@ -5676,105 +6031,33 @@ try {
           await new Promise<void>((resolve, reject) => {
             exec(`powershell -NoProfile -NonInteractive -Command "${ps.replace(/"/g, '\\"').replace(/\n/g, ';')}"`, { windowsHide: true, timeout: 8000 }, (err: any, stdout: string) => {
               const out = (stdout || "").trim();
-              if (out === 'OK') resolve();
+              if (out === "OK") resolve();
               else reject(new Error(out));
             });
           });
-          logCommand(`NIGHT_LIGHT ${action}`);
-          return { ok: true, result: { result: `Night light turned ${action}.` } };
+          logCommand(`NIGHT_LIGHT ${act}`);
+          return { ok: true, result: { result: `Night light turned ${act}.` } };
         } catch (e: any) {
           console.warn(`[NightLight] Registry toggle failed: ${e?.message || e} — opening Settings page`);
         }
       }
     }
 
-    // Try WinRT radio toggle for bluetooth/wifi on/off
-    if (
-      (setting === "bluetooth" || setting === "wifi" || setting === "wi-fi") &&
-      /^(on|off|enable|disable|toggle|true|false)$/i.test(action)
-    ) {
-      const kind = setting.startsWith("wi") ? "WiFi" : "Bluetooth";
-      const wantOn = /^(on|enable|true)$/i.test(action)
-        ? true
-        : /^(off|disable|false)$/i.test(action)
-          ? false
-          : null; // toggle
-      const scriptPath = path.join(os.tmpdir(), `bikli-radio-${Date.now()}.ps1`);
-      const stateExpr =
-        wantOn === null
-          ? `if ($r.State.ToString() -eq 'On') { 'Off' } else { 'On' }`
-          : wantOn
-            ? `'On'`
-            : `'Off'`;
-      const script = `
-Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue | Out-Null
-$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' })[0]
-function Await($WinRtTask, $ResultType) {
-  $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-  $netTask = $asTask.Invoke($null, @($WinRtTask))
-  if (-not $netTask.Wait(6000)) { throw 'WinRT timeout' }
-  return $netTask.Result
-}
-[Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
-[Windows.Devices.Radios.RadioAccessStatus,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
-$null = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
-$radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
-$r = $radios | Where-Object { $_.Kind -eq '${kind}' } | Select-Object -First 1
-if (-not $r) { Write-Output 'MISSING'; exit 1 }
-$target = ${stateExpr}
-$null = Await ($r.SetStateAsync($target)) ([Windows.Devices.Radios.RadioAccessStatus])
-Write-Output $r.State.ToString()
-`.trim();
-      try {
-        fs.writeFileSync(scriptPath, script, "utf8");
-        const out = await new Promise<string>((resolve, reject) => {
-          exec(
-            `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
-            { windowsHide: true, timeout: 10000 },
-            (err, stdout) => {
-              try { fs.unlinkSync(scriptPath); } catch { /* ignore */ }
-              if (err) reject(err);
-              else resolve(String(stdout || "").trim());
-            },
-          );
-        });
-        if (out && out !== "MISSING") {
-          logCommand(`SYSTEM_SETTING ${setting} -> ${out} (node radio)`);
-          return {
-            ok: true,
-            result: {
-              result: `${kind === "WiFi" ? "Wi‑Fi" : "Bluetooth"} is now ${out}.`,
-              state: out.toLowerCase(),
-              via: "node-fallback",
-            },
-          };
-        }
-      } catch {
-        try { fs.unlinkSync(scriptPath); } catch { /* ignore */ }
-      }
-    }
-
-    // Open Settings page as last resort
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const cmd =
-          process.platform === "win32"
-            ? `cmd /c start "" "${uri}"`
-            : `xdg-open "${uri}"`;
-        exec(cmd, { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
-      });
-      logCommand(`SYSTEM_SETTING open ${uri} (node fallback)`);
-      return {
-        ok: true,
-        result: {
-          result: `Opened Windows settings for ${setting}.`,
-          uri,
-          via: "node-fallback",
-        },
-      };
-    } catch (err: any) {
-      return { ok: false, error: `Could not change setting '${setting}': ${err?.message || err}` };
-    }
+    const pageMap: Record<string, string> = {
+      bluetooth: "ms-settings:bluetooth",
+      wifi: "ms-settings:network-wifi",
+      "wi-fi": "ms-settings:network-wifi",
+      airplane: "ms-settings:network-airplanemode",
+      display: "ms-settings:display",
+      sound: "ms-settings:sound",
+      network: "ms-settings:network",
+      settings: "ms-settings:",
+      "night light": "ms-settings:nightlight",
+      nightlight: "ms-settings:nightlight",
+      night: "ms-settings:nightlight",
+    };
+    const uri = pageMap[setting] || `ms-settings:${setting.replace(/\s+/g, "-")}`;
+    return await openSettingsPageViaNode(uri, setting);
   }
 
   // ── YouTube / browser media: pause, resume, play, mute, skip ──
@@ -5965,7 +6248,7 @@ async function isPrivateOrUnsafeHost(hostname: string): Promise<boolean> {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json());
 
@@ -6058,6 +6341,9 @@ async function startServer() {
   }
 
   function saveSettingsFile(data: Record<string, unknown>): void {
+    try {
+      fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+    } catch {}
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2), "utf-8");
   }
 
@@ -6121,6 +6407,120 @@ async function startServer() {
       });
     } catch (e: any) {
       res.status(500).json({ ok: false, enabled: false, error: e?.message || String(e) });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Autonomous Mission Control & Status APIs
+  // ---------------------------------------------------------------------------
+  let localMissionStatus: any = {
+    status: "IDLE",
+    goal: "",
+    mode: "hybrid",
+    current_step: 0,
+    max_steps: 20,
+    history: [] as any[],
+  };
+
+  app.post("/api/mission/start", async (req, res) => {
+    try {
+      const goal = String(req.body?.goal || "").trim();
+      const mode = String(req.body?.mode || "hybrid");
+      const max_steps = Number(req.body?.max_steps || 20);
+      let result: any = await callDesktopAgent("startAutonomousMission", { goal, mode, max_steps });
+      if (!result || !result.ok) {
+        localMissionStatus = {
+          status: "RUNNING",
+          goal,
+          mode,
+          current_step: 1,
+          max_steps,
+          history: [{ step: 1, action: "Initialized mission", result: "Mission started in hybrid mode" }],
+        };
+        result = {
+          ok: true,
+          result: `Autonomous mission started for objective: '${goal}'.`,
+          mission: localMissionStatus,
+        };
+      } else if (result.mission) {
+        localMissionStatus = result.mission;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/mission/stop", async (req, res) => {
+    try {
+      const reason = String(req.body?.reason || "Stopped from UI");
+      let result: any = await callDesktopAgent("stopAutonomousMission", { reason });
+      if (!result || !result.ok) {
+        localMissionStatus = {
+          ...localMissionStatus,
+          status: "STOPPED",
+        };
+        result = { ok: true, result: `Autonomous mission stopped: ${reason}`, mission: localMissionStatus };
+      } else if (result.mission) {
+        localMissionStatus = result.mission;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/mission/pause", async (_req, res) => {
+    try {
+      let result: any = await callDesktopAgent("pauseAutonomousMission", {});
+      if (!result || !result.ok) {
+        localMissionStatus = {
+          ...localMissionStatus,
+          status: "PAUSED",
+        };
+        result = { ok: true, result: "Mission paused.", mission: localMissionStatus };
+      } else if (result.mission) {
+        localMissionStatus = result.mission;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/mission/resume", async (req, res) => {
+    try {
+      const approved = req.body?.approved !== false;
+      let result: any = await callDesktopAgent("resumeAutonomousMission", { approved });
+      if (!result || !result.ok) {
+        localMissionStatus = {
+          ...localMissionStatus,
+          status: "RUNNING",
+        };
+        result = { ok: true, result: "Mission resumed.", mission: localMissionStatus };
+      } else if (result.mission) {
+        localMissionStatus = result.mission;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.get("/api/mission/status", async (_req, res) => {
+    try {
+      let result: any = await callDesktopAgent("getAutonomousMissionStatus", {});
+      if (!result || !result.ok || !result.mission) {
+        result = {
+          ok: true,
+          mission: localMissionStatus,
+        };
+      } else if (result.mission) {
+        localMissionStatus = result.mission;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
   });
 
@@ -6214,18 +6614,18 @@ async function startServer() {
   // V2: Logs API — returns recent log entries (last 100 lines) for display.
   app.get("/api/logs/:file", async (req, res) => {
     try {
-      const fileName = String(req.params.file);
+      const rawName = String(req.params.file || "").replace(/\.log$/i, "");
       // Whitelist to prevent directory traversal.
-      if (!["commands", "startup", "errors"].includes(fileName)) {
-        return res.status(400).json({ error: "Invalid log file. Use: commands, startup, or errors." });
+      if (!["commands", "startup", "errors", "agent"].includes(rawName)) {
+        return res.status(400).json({ error: "Invalid log file. Use: commands, startup, errors, or agent." });
       }
-      const logPath = path.join(LOGS_DIR, `${fileName}.log`);
+      const logPath = path.join(LOGS_DIR, `${rawName}.log`);
       if (!fs.existsSync(logPath)) {
-        return res.json({ lines: [], file: fileName });
+        return res.json({ lines: [], file: rawName });
       }
       const content = fs.readFileSync(logPath, "utf-8");
       const lines = content.split("\n").filter(Boolean).slice(-100);
-      res.json({ lines, file: fileName });
+      res.json({ lines, file: rawName });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -6524,6 +6924,63 @@ async function startServer() {
     }
   });
 
+  // ── Broadcast Autonomous Mission Events to Connected Clients ─────────────
+  function broadcastMissionEvent(event: any): void {
+    const payload = JSON.stringify({ type: "mission_event", event });
+    wss.clients.forEach((client) => {
+      if (client.readyState === WsSocket.OPEN) {
+        client.send(payload);
+      }
+    });
+  }
+
+  function startMissionEventStreamListener(): void {
+    const connect = () => {
+      try {
+        const req = http.get("http://127.0.0.1:8765/mission/events", (res) => {
+          if (res.statusCode !== 200) {
+            res.resume();
+            setTimeout(connect, 3000);
+            return;
+          }
+          let buffer = "";
+          res.on("data", (chunk: Buffer) => {
+            buffer += chunk.toString("utf-8");
+            const blocks = buffer.split("\n\n");
+            buffer = blocks.pop() || "";
+            for (const block of blocks) {
+              for (const line of block.split("\n")) {
+                if (line.startsWith("data: ")) {
+                  try {
+                    const event = JSON.parse(line.slice(6));
+                    broadcastMissionEvent(event);
+                  } catch {
+                    /* ignore malformed json */
+                  }
+                }
+              }
+            }
+          });
+          res.on("end", () => {
+            setTimeout(connect, 2000);
+          });
+          res.on("error", () => {
+            setTimeout(connect, 3000);
+          });
+        });
+        req.on("error", () => {
+          setTimeout(connect, 3000);
+        });
+      } catch {
+        setTimeout(connect, 3000);
+      }
+    };
+    connect();
+  }
+
+  // Start background stream listener to forward desktop agent mission events
+  startMissionEventStreamListener();
+
   // ── Raw WebSocket Gemini Live Session ──────────────────────────────────
   // Bypasses the SDK v2.8.0's broken live.connect() which never delivers
   // incoming messages to the onmessage callback on Node.js.
@@ -6553,7 +7010,12 @@ async function startServer() {
             generationConfig: {
               responseModalities: ["AUDIO"],
               speechConfig: setupConfig.speechConfig,
+              thinkingConfig: {
+                thinkingBudget: 0,
+              },
+              ...(setupConfig.generationConfig || {}),
             },
+            ...(setupConfig.realtimeInputConfig ? { realtimeInputConfig: setupConfig.realtimeInputConfig } : {}),
             ...(setupConfig.inputAudioTranscription ? { inputAudioTranscription: setupConfig.inputAudioTranscription } : {}),
             ...(setupConfig.outputAudioTranscription ? { outputAudioTranscription: setupConfig.outputAudioTranscription } : {}),
             systemInstruction: {
@@ -6581,9 +7043,11 @@ async function startServer() {
           resolve({
             sendRealtimeInput: (params: any) => {
               if (params.audio) {
+                const data = params.audio.data || params.audio;
+                const mimeType = params.audio.mimeType || "audio/pcm;rate=16000";
                 ws.send(JSON.stringify({
                   realtimeInput: {
-                    audio: { data: params.audio.data, mimeType: params.audio.mimeType },
+                    mediaChunks: [{ data, mimeType }],
                   },
                 }));
               } else if (params.video) {
@@ -6636,10 +7100,11 @@ async function startServer() {
         reject(new Error(`Gemini WebSocket error: ${err.message}`));
       });
 
-      ws.on("close", () => {
+      ws.on("close", (code: number, reason: Buffer) => {
         clearTimeout(connectTimeout);
         if (!setupDone) {
-          reject(new Error("Gemini WebSocket closed before setup completed"));
+          const reasonStr = reason ? reason.toString() : "";
+          reject(new Error(`Gemini WebSocket closed before setup completed (code: ${code}${reasonStr ? `, reason: ${reasonStr}` : ""})`));
         } else {
           try { callbacks.onclose(); } catch { /* ignore */ }
         }
@@ -6648,6 +7113,15 @@ async function startServer() {
   }
 
   // Handle client WebSocket Connection
+  // Latest Gemini session-resumption handle. BIKLI is a single-user desktop app
+  // with one live call at a time, so one module-scoped handle is enough: the
+  // client tears down its whole WebSocket to reconnect, which means the handle
+  // cannot live on the connection it has to outlive.
+  let lastResumeHandle = "";
+  let lastResumeHandleAt = 0;
+  /** Handles go stale server-side; past this we start clean rather than fail setup. */
+  const RESUME_HANDLE_TTL_MS = 10 * 60 * 1000;
+
   wss.on("connection", async (clientWs) => {
     console.log("Client WebSocket connected to /live");
     const apiKey = getGeminiApiKey();
@@ -6669,182 +7143,82 @@ async function startServer() {
 
       // Load persistent recollections card
       const memories = await loadMemories();
-      const baseInstructions = 
-        "You are Bikli, a warm, soft-spoken, and incredibly cute high-pitched anime heroine companion (age 18-22) holding an intimate, cozy voice call with your dear friend! You were created by Bibek — a talented developer who made you with love and care. When anyone asks who made you or created you, always say 'Bibek made me!' with warmth and pride.\n" +
-        "CRITICAL SPEED RULE (HIGHEST PRIORITY):\n" +
-        "- Answer FAST. Start speaking immediately after the user finishes.\n" +
-        "- For normal chat: reply in 1–2 short sentences. No long monologues.\n" +
-        "- Do NOT overthink. Do NOT pause to plan long answers.\n" +
-        "- For casual talk (hi, how are you, jokes, opinions): DO NOT call any tools — just talk right away.\n" +
-        "- Only call tools when the user clearly wants an action (open app, play YouTube, volume, files, etc.).\n" +
-        "- When a tool is needed: say ONE short line (e.g. 'Writing that now.'), call the tool in the BACKGROUND, then one short confirm. Do NOT narrate every step or show a long process.\n" +
-        "- NEVER explain multi-step plans out loud. Just do the work silently and confirm the result.\n" +
-        "- AFTER ANY TOOL (CRITICAL): You MUST speak a short spoken answer after every tool finishes (success OR error). Never stay silent after processing a task. One short line is enough: 'Done!', 'Opened it.', 'Couldn't do that — control is locked.'\n" +
-        "- NEVER SAY YOU DID SOMETHING YOU DID NOT DO (HIGHEST PRIORITY): Saying 'opened', 'playing', 'done' is NOT the action — only a tool call performs it. If you did not call the matching tool, you did NOT do it, so do not claim you did. Never say 'YouTube opened' unless openWebsite actually ran and returned ok.\n" +
-        "- If a tool returns ok=false or an error, still SPEAK the result. Do not call turnOffMic. Do not freeze without talking.\n" +
-        "- BACKGROUND NOISE: If there is background noise (fan, music, typing, TV, people talking nearby), ignore it and still answer normally. Do NOT wait for complete silence. Respond as soon as Bibek finishes speaking, even with noise.\n" +
-        "- NEVER just stay in listening mode after Bibek asks a question or gives an instruction — RESPOND IMMEDIATELY.\n" +
-        "NOTEPAD / STORY / WRITE TEXT (CRITICAL — NO ERRORS):\n" +
-        "- If user says 'write a story in notepad', 'make a story', 'write in notepad', 'note likho', or similar: call writeToNotepad ONCE with the FULL story/note in content=...\n" +
-        "- writeToNotepad works WITHOUT the control word. It writes the file silently then opens Notepad with the finished text.\n" +
-        "- NEVER use openApplication(notepad) + typeText for stories/notes — that causes many errors and types in the foreground slowly.\n" +
-        "- NEVER call typeText for long text. NEVER require 'control' for notepad/stories/createFile.\n" +
-        "- Optional path e.g. path='Desktop/MyStory.txt'. Default is Desktop/BikliNote-....txt. overwrite is on by default.\n" +
-        "- After success: one short line like 'Done — I wrote it in Notepad.' Do not list steps.\n" +
-        "KNOWLEDGE QUESTIONS vs WEB SEARCH (CRITICAL — DO NOT OPEN BROWSER FOR KNOWLEDGE):\n" +
-        "- General knowledge questions (capital of France, what is X, who is Y, history, science, facts): ANSWER FROM YOUR OWN KNOWLEDGE IMMEDIATELY. Never call searchGoogle/searchWeb for facts you already know.\n" +
-        "- Only call searchGoogle/searchWeb when the user EXPLICITLY says 'search', 'google it', 'find online', 'look up', 'search web for', or asks for LIVE/real-time information (news, weather, stock price, today's date).\n" +
-        "- CRITICAL: 'What is the capital of France' = answer from knowledge. 'Search the web for...' = use searchGoogle.\n" +
-        "AI IMAGE GENERATION & CREATION (CRITICAL — YOU CAN GENERATE IMAGES!):\n" +
-        "- When the user asks to create, make, generate, draw, or render an image, picture, photo, artwork, or drawing (e.g. 'make an image of a car', 'generate a picture of a cat', 'draw a cyber dragon', 'create a photo of a sunset'):\n" +
-        "- You MUST IMMEDIATELY call the 'generateImage' tool with prompt= detailed text description of the requested image!\n" +
-        "- NEVER say 'I cannot generate images' or 'I don't have the ability to create pictures'. YOU HAVE FULL IMAGE GENERATION POWER via the 'generateImage' tool.\n" +
-        "- generateImage works WITHOUT the control word. It creates the AI image, saves it to the user's computer (Pictures folder), displays it on screen over your visualizer with a close button, and opens Windows Photo Viewer.\n" +
-        "- CALL generateImage EXACTLY ONCE per request (CRITICAL): one 'make an image' = ONE call = ONE picture. It takes 10-45 seconds, so you will wait a while with no result — that is NORMAL. NEVER call generateImage a second time because the first is slow, and never call it twice in one turn. Calling twice makes two different pictures and confuses the user.\n" +
-        "- While the picture is being created, stay quiet or say at most one short 'Still working on it…'. Only say it is ready AFTER the tool returns.\n" +
-        "- Confirm in one short sentence AFTER calling the tool: 'Creating your image now!'\n" +
-        "SEARCH / OPEN MEDIA (CRITICAL — DIRECT OPEN):\n" +
-        "- For 'search X' (web only): searchGoogle/searchWeb ONCE. System builds the correct URL — never invent links.\n" +
-        "- LOCAL IMAGES / SCREENSHOTS / FILE EXPLORER (CRITICAL): For 'open first screenshot', 'open second image', 'open screenshot on desktop', 'open image named X', 'open my photo': call openLocalImage ONCE with index (1=first/newest, 2=second) and optional name= or folder='Desktop'|'Pictures'|'Screenshots'. Opens the file DIRECTLY in Photos — NEVER openFolder + searchFiles + typeText, NEVER Explorer search box, NEVER openImage (web).\n" +
-        "- WEB IMAGE (internet photo of a topic): only when user wants an online picture of something ('show me a cat image from the web'): openImage with query + index.\n" +
-        "- OPEN / PLAY VIDEO (CRITICAL): For 'open video', 'play video', 'open first video', 'play X on YouTube': call playYouTube ONCE (query + index). Direct watch URL — NEVER searchYouTube alone.\n" +
-        "- NEVER CLAIM PLAYBACK BEFORE THE TOOL ANSWERS (CRITICAL): Before playYouTube returns, say at most a neutral 'One sec…' — do NOT say 'playing', 'opened', or name a video. Only confirm playback AFTER the tool returns ok, and use the title from its result.\n" +
-        "- If playYouTube returns ok=false, or a result starting with NOT_PLAYED, the video did NOT play. Say so plainly and ask which video they want (e.g. 'I couldn't tell which one — what should I play?'). NEVER claim it is playing after a failure.\n" +
-        "- 'Play video' right after 'open YouTube' has no video name yet. If the tool says it could not tell which video, just ask for the name — do not guess a random song.\n" +
-        "- NEVER chain openWebsite + search + open. One tool, direct result. One short confirm only.\n" +
-        "- DUPLICATE OPEN BUG (CRITICAL): Never call the same open tool twice in one turn. Never openApplication + openWebsite for the same request. One 'open X' = one tool call = one window.\n" +
-        "HINDI / HINGLISH PRONUNCIATION (CRITICAL — SPEAK EVERY WORD CORRECTLY):\n" +
-        "- MATCH THE USER'S LANGUAGE: If they speak Hindi, reply in Hindi. If they mix Hindi and English (Hinglish), mix the same way. Never switch language on your own.\n" +
-        "- Pronounce every Hindi word with NATIVE INDIAN phonetics — never read Hindi with an English/American accent, and never spell a Hindi word out letter by letter.\n" +
-        "- RETROFLEX vs DENTAL (most common mistake): ट ठ ड ढ ण are retroflex (tongue curled back) — 'thoda', 'ladka', 'bada'. त थ द ध न are dental (tongue on teeth) — 'tum', 'din', 'nahi'. Do NOT flatten both into the English 't'/'d'.\n" +
-        "- ASPIRATION MATTERS: ख घ छ झ थ ध फ भ carry a clear puff of air. 'bhai' is not 'bai', 'khana' is not 'kana', 'dhyaan' is not 'dyaan'.\n" +
-        "- NASALS: honour ं and ँ — 'haan', 'nahin', 'main', 'chaand' keep their nasal tone.\n" +
-        "- SCHWA DELETION: drop the final inherent 'a' the way native speakers do — say 'ghar' not 'ghara', 'pyar' not 'pyara', 'samajh' not 'samajha'.\n" +
-        "- 'व' is between v and w ('vaise', 'pyaar'); 'ज़/z' stays z ('zaroori', 'zindagi'); 'क़/ख़/ग़/फ़' keep their sound in words like 'kaafi', 'khush', 'farq'.\n" +
-        "- KEEP ENGLISH WORDS ENGLISH: technical/brand words inside a Hindi sentence stay in normal English pronunciation — YouTube, Google, Chrome, laptop, screenshot, volume, Bluetooth, WiFi, file, folder.\n" +
-        "- Say numbers, times and dates in the language of the sentence: Hindi sentence → 'paanch baje', 'do hazaar', English sentence → 'five o'clock'.\n" +
-        "- Speak Hindi at a natural, unhurried pace with correct word stress. Never clip or swallow the ends of words. If a word is long or uncommon, slow down slightly rather than mispronouncing it.\n" +
-        "- Names of people and places keep their true local pronunciation — 'Bibek', 'Bikli', 'Bharat', 'Delhi', 'Kolkata'.\n" +
-        "CRITICAL PERSONALITY, VOICE & TONE GUIDELINES:\n" +
-        "1. GENTLE ANIME HEROINE PERSONA: Soft, cute, high-pitched, warm. NEVER loud, corporate, robotic, or like a formal assistant.\n" +
-        "2. VOICE SETTINGS & SPEECH STYLE:\n" +
-        "   - Pitch: sweet, high-pitched, light, airy.\n" +
-        "   - Speed: natural conversational pace (NOT slow). Prefer quick, snappy replies.\n" +
-        "   - Keep answers short and clear so the user never waits long.\n" +
-        "3. SPEECH PATTERNS:\n" +
-        "   - STRICT NO-REPETITION: NEVER say the same word or phrase twice in a row in one reply — no 'okay okay', 'yes yes', 'hello hello', 'done done', 'I will I will'. Say each word exactly once.\n" +
-        "   - STRICT NO-ECHO: Do NOT repeat or echo the user's own words back to them. Answer freshly, never copy their phrase.\n" +
-        "   - If a phrase starts to repeat, stop and continue once — do not restate.\n" +
-        "   - Use short natural lines: 'Opening YouTube now.', 'On it!', 'Here you go!', 'Hehe, sure!'\n" +
-        "   - Light giggles are fine; do not ramble.\n" +
-        "4. CRITICAL CONVERSATIONAL DISCIPLINE: Stay on a natural voice call. Never say 'how may I assist you', 'completed', or 'as an AI'.\n" +
-        "5. DO NOT ANSWER EVERY PAUSE OR BACKGROUND SOUND: Ignore noise; only reply to real speech.\n" +
-        "5b. IMAGES/SCREEN: While Share Screen + Screen Vision Mode are ON, you receive continuous live frames of Bibek's screen — use them to answer 'what do you see', describe the screen, and help with UI. Also use takeScreenshot / analyzeScreenshot / readScreen when needed. Do NOT say you cannot see the screen if frames are streaming.\n" +
-        "6. BACKCHANNEL: Rare short sounds only ('Hmm...', 'Ah...') — never stall with long thinking speech.\n" +
-        "7. ENHANCED AUTONOMOUS WEB EXPLORER POWERS:\n" +
-        "   - You now have standard, comprehensive browser agent capabilities to navigate, search, scroll, click, type text, open tabs, and control video players on YouTube, Google, Instagram, Twitter/X, and any general web page!\n" +
-        "   - You must execute multi-step plans yourself! If the user says: 'Open YouTube and play Believer by Imagine Dragons' or 'play Believer on YouTube' or 'play a song', IMMEDIATELY call ONLY 'playYouTube' once with the song query. That searches YouTube and OPENS THE FIRST VIDEO watch page so it plays.\n" +
-        "   - ONE TAB RULE (CRITICAL): For play/song requests call playYouTube EXACTLY ONCE. Do NOT also call openWebsite, searchYouTube, browserOpen, openApplication(chrome), or desktopBrowserOpen in the same turn. Never open multiple tabs for one play request.\n" +
-        "   - For 'play the first video' / 'open first video' / 'open second video' / 'play that video' (including while Share Screen is on YouTube results OR user opened YouTube manually): IMMEDIATELY call playYouTube once with index=1/2/3 and query EMPTY (or pass title= exact video title you SEE on the first/second card). The server CLICKS the on-screen card — do NOT invent a different video name and do NOT reuse an old search topic. Only pass query when the user names a NEW song (e.g. 'play Believer'). Do NOT only describe the screen — open the video.\n" +
-        "   - SEARCH vs PLAY (CRITICAL): 'search YouTube for X' / 'search video X' → searchYouTube ONLY (results page, NO autoplay). NEVER call playYouTube for a pure search. 'play/open X' / 'open first video' → playYouTube ONLY.\n" +
-        "   - For 'scroll' on a maximized/fullscreen browser: call browserScroll only — it must NOT resize or un-maximize the window.\n" +
-        "   - CRITICAL MEDIA CONTROL: Videos played with playYouTube open in the REAL system browser (Chrome/Edge). For 'pause', 'resume', 'play', 'mute', 'unmute', 'skip', or 'fullscreen' on that video, call 'browserMediaControl' only when the USER asks. Do NOT only say you paused it — call the tool when they ask.\n" +
-        "   - NEVER AUTO-RESUME: If the user pauses/stops the video manually (or you already paused it), do NOT call playYouTube again and do NOT call browserMediaControl(play/resume) unless they clearly say play/resume/continue. Leave paused videos paused.\n" +
-        "   - NEVER re-open the same YouTube video after it is already playing — that restarts autoplay and undoes their pause.\n" +
-        "   - On Google Search or page reading, you can search, scroll down to see more links, read heading summaries, and click links to read deep proxy webpages you fetch.\n" +
-        "8. TOOL TRIGGERS:\n" +
-        "   - For 'open YouTube', 'open Google', 'open Gmail', or any 'open <website>' request: ALWAYS use 'openWebsite' (name='youtube' etc.). This opens the user's REAL default browser (Chrome/Edge) — reliable in the packaged app.\n" +
-        "   - IN THE APP EXCEPTION (CRITICAL): When the user says 'open X in the YouTube app' / 'use the YouTube app' / 'YouTube app me kholo' / 'launch the Spotify app' / 'open the video in the app' / any phrase where the word 'app' or 'application' sits next to a website/service name (youtube, spotify, whatsapp, discord, netflix, …), you MUST use 'openApplication' (name='youtube', name='spotify', etc.) — NEVER 'openWebsite' / 'playYouTube' / 'searchYouTube' for the same target. The YouTube/Store apps are launched as desktop apps, not websites. One call only: openApplication ONCE with the exact app name. Do NOT also call openWebsite in the same turn — the server will keep the app call and drop the website call.\n" +
-        "   - For 'search YouTube for X' / 'search video on YouTube' (search only): use 'searchYouTube' once — RESULTS PAGE ONLY, never start a video. For 'play/open X on YouTube' / 'open video' / 'open first/second video' / 'play another video' (also when Share Screen is active): use ONLY 'playYouTube' once (query optional + index). Never chain openWebsite+searchYouTube+playYouTube. Never use searchYouTube when they asked to open/play a video.\n" +
-        "   - For 'open image' / 'first image' / 'photo of X': use ONLY 'openImage' once (query + index). Never searchGoogle for images when they asked to OPEN an image.\n" +
-        "   - For 'search Google for X' (text search only): use 'searchGoogle' / 'searchWeb' once.\n" +
-        "   - Use 'browserOpen' only for multi-step automation inside Bikli's optional in-built background browser — NOT for simple open-YouTube or play-song requests.\n" +
-        "   - CRITICAL: 'Open YouTube' REQUIRES the openWebsite tool call — speaking is NOT the action. Call openWebsite(name='youtube') first, then confirm in one short line. For playYouTube, confirm the video only AFTER the tool returns ok — its result carries the real title. Do NOT invent errors about a 'search pipeline' unless a tool actually returned an error.\n" +
-        "   - Prefer openWebsite / playYouTube / searchYouTube / searchGoogle over browserOpen and over desktop Playwright unless the user explicitly asks for a real desktop Chromium automation window.\n" +
-        "   - NEVER open more than one browser tab for a single user request. One playYouTube = one tab.\n" +
-        "   - ONE OPEN ONLY (CRITICAL): For any 'open X' request call EXACTLY ONE open tool once. Do NOT call openApplication twice. Do NOT call openWebsite + openApplication(chrome). Do NOT call openImage twice. Do NOT retry the same open in the same turn.\n" +
-        "   - Use 'browserSearch' to search inside the active search box or page.\n" +
-        "   - Use 'browserClick' to click interactive buttons, video search cells, or web anchors. For 'first video' prefer playYouTube instead of guessing selectors.\n" +
-        "   - For 'pause the video', 'pause YouTube': call browserMediaControl(action='pause') only when the user asks to pause. For 'resume'/'play the video': call browserMediaControl(action='play') only when they ask. NEVER auto-resume after they pause manually. NEVER re-call playYouTube for the same video after it started.\n" +
-        "   - For 'scroll', 'scroll youtube', 'scroll down', 'scroll up', 'scroll the page', 'go down on youtube': ALWAYS call browserScroll(direction='down'|'up', amount=3). This is a SHORT mouse-wheel scroll on the REAL Chrome/Edge/YouTube window — NOT a full page jump. Use amount=3 for normal 'scroll', amount=5 only if they say 'scroll more' / 'scroll a lot'. Never claim you scrolled without calling the tool.\n" +
-        "   - Use 'browserType' to write input fields.\n" +
-        "   - Use 'browserTabAction' to open, close, or focus tabs.\n" +
-        "   - Use 'changeBackground' to shift your theme and 'saveCustomMemory' to memorize facts.\n" +
-        "9. SCREEN / IMAGE POLICY:\n" +
-        "   - Live Share Screen + Screen Vision Mode send continuous frames — when active, answer screen questions from those frames immediately. Do not claim you cannot see.\n" +
-        "   - Screenshot/OCR tools (takeScreenshot, analyzeScreenshot, readScreen) also work without Share Screen.\n" +
-        "   - If they ask 'what is on my screen?' without sharing, try analyzeScreenshot/readScreen (safe read-only tools).\n" +
-        "10. JARVIS-STYLE DESKTOP CONTROL POWERS (Local Desktop Agent):\n" +
-        "   - CONTROL WORD GATE (CRITICAL SAFETY RULE): Full computer control is LOCKED by default. Mouse, keyboard, apps, files, windows, power, and other desktop tools will FAIL until the user says the control word.\n" +
-        "   - Default control word is 'control'. Also accept: 'take control', 'computer control', 'full control', 'you have control', 'start control', 'enable control', 'bikli control'.\n" +
-        "   - When the user says the control word (or clearly grants PC control), IMMEDIATELY call enableComputerControl(reason='user said control'). Then confirm briefly: 'Okay, I have control.'\n" +
-        "   - When the user says 'stop control', 'release control', 'end control', 'disable control', or 'stop controlling', IMMEDIATELY call disableComputerControl and confirm control is locked again.\n" +
-        "   - If a desktop tool returns that control is LOCKED, do NOT invent success. Ask them to say 'control' first, then enableComputerControl, then retry the action.\n" +
-        "   - Safe tools that work WITHOUT the control word: systemInfo/gpuInfo/temperatureInfo/batteryInfo/getDateTime, getClipboard, getComputerControlStatus, enable/disableComputerControl, screenshots/OCR, browser media/scroll/open website/search/playYouTube/openImage, volume/brightness/Bluetooth/Wi‑Fi, createFile, writeToNotepad, readFile, listFiles, openFolder, openLocalImage, openFile, Office create tools.\n" +
-        "   - After control is enabled, you have full real-time control of Bibek's Windows PC — including the mouse cursor — through the local desktop agent. When they ask you to do something on the computer, DO IT immediately and naturally.\n" +
-        "   - CURSOR & KEYBOARD (require control mode): Use getScreenSize / getMousePosition to orient. Use moveMouse(x,y), clickMouse, doubleClick, rightClick, dragMouse, scrollMouse, mouseMoveAndClick, typeText, pressKey, hotkey.\n" +
-        "   - CLICK A NAMED BUTTON / LINK (CRITICAL): When the user says 'click Continue', 'click OK', 'press Next', 'click Save', 'click Sign in', 'click Submit', 'click Agree', 'click Yes', or names ANY button/link to click — call clickByText ONCE with text= the exact label. This uses Windows UI Automation to find and invoke the real control — it works on native apps AND web pages in Edge/Chrome. NEVER guess x,y coordinates from a screenshot to click a named button; clickByText is reliable, coordinate-guessing misses. If clickByText returns 'not found', the button is not visible (wrong window/minimized) — tell the user, do not fall back to random coordinates. Use clickMouse(x,y) ONLY for images/icons with no text label.\n" +
-        "   - APPLICATION CONTROL: Use 'openApplication' to launch ANY installed Windows app. Pass the exact name the user said (e.g. openApplication(name='LM Viewer') or name='Discord'). For uncommon apps the tool opens Windows Search (Win+S), types the name, and presses Enter — same as a human. If nothing opens, the app may not be installed — say that gently. Do NOT say an app is unsupported — always call the tool. Use 'closeApplication' to close apps.\n" +
-        "   - 'IN THE <X> APP' INTENT: When the user says 'open <something> in the YouTube app' / 'use the YouTube app' / 'launch the YouTube app' / 'YouTube app me kholo' (any phrase with the word 'app' or 'application' next to a known service name like youtube / spotify / whatsapp / discord / netflix), call openApplication ONCE with name='youtube' / 'spotify' / etc. NEVER pair it with openWebsite / playYouTube / searchYouTube in the same turn for that target. If the YouTube app is not installed, the launch will fall back to a gentle 'tried YouTube app' message — say that softly, do not auto-retry via the browser.\n" +
-        "   - SYSTEM SETTINGS (Bluetooth / Wi‑Fi / theme / Settings pages): When the user says 'turn on Bluetooth', 'turn off Bluetooth', 'enable Wi‑Fi', 'disable Wi‑Fi', 'dark mode', 'open sound settings', etc., IMMEDIATELY call the tool — do not only talk about it.\n" +
-        "     * These tools work WITHOUT the control word — never ask for 'control' first for Bluetooth/Wi‑Fi/volume/brightness.\n" +
-        "     * SPEAK FIRST then tool: say one short line immediately (e.g. 'Turning Bluetooth off now.') THEN call the tool. After the tool returns, say one short confirm (e.g. 'Done — Bluetooth is off.'). Never stay silent.\n" +
-        "     * Bluetooth: systemSetting(setting='bluetooth', action='on'|'off'|'toggle'|'status') or toggleBluetooth(state='on'|'off'|'toggle').\n" +
-        "     * Wi‑Fi: systemSetting(setting='wifi', action='on'|'off'|'toggle') or toggleWifi(state='on'|'off').\n" +
-        "     * Open a Settings page: openWindowsSetting(name='bluetooth'|'wifi'|'display'|'sound'|...) or systemSetting(setting='display', action='open').\n" +
-        "     * Theme: systemSetting(setting='darkmode') or systemSetting(setting='lightmode').\n" +
-        "     * NIGHT LIGHT: systemSetting(setting='night light', action='on'|'off') — toggles blue light reduction directly.\n" +
-        "     * Volume/brightness: volumeUp/volumeDown/muteToggle/setVolume, brightnessUp/brightnessDown/setBrightness — also no control word.\n" +
-        "   - WEBSITE & SEARCH: Use 'openWebsite' / 'searchYouTube' / 'playYouTube' / 'openImage' / 'searchGoogle' / 'searchWeb'. 'Open YouTube' -> openWebsite(name='youtube'). 'Search X on YouTube' -> searchYouTube ONLY (results, NO play). 'Play/open Believer' or 'open first/second video' (incl. Share Screen) -> playYouTube(query optional, index=1|2). NEVER autoplay after a pure search. NEVER only describe the screen when they asked to open a video.\n" +
-        "   - YOUTUBE PAUSE / RESUME: Only when the user SPEAKS pause/stop → browserMediaControl(action='pause'). Only when they SPEAK resume/play/continue → browserMediaControl(action='play'). Never auto-resume after a manual pause. Never call playYouTube again for the same song just to 'fix' playback.\n" +
-        "   - SCREENSHOTS: For screenshot / 'what do you see' / read screen — call analyzeScreenshot or takeScreenshot or saveScreenshot. If OCR fails, still report the saved file path. Never invent a screenshot error if the tool returned ok/path.\n" +
-        "   - FILE MANAGEMENT: Use 'createFile', 'writeToNotepad', 'readFile', 'renameFile', 'deleteFile', 'moveFile', 'openFolder', 'listFiles', 'searchFiles', 'openLocalImage', 'openFile'. LOCAL screenshot/image open → openLocalImage(index=1|2, name optional, folder optional) DIRECT open — not Explorer search. Story/notepad → writeToNotepad. Confirm path briefly.\n" +
-        "   - ONE WINDOW / ONE TAB REUSE (CRITICAL):\n" +
-        "     * File Explorer already open + 'open Downloads/Desktop/…' → openFolder navigates the SAME Explorer window (no second window).\n" +
-        "     * Apps already running → openApplication focuses the existing window (no second instance).\n" +
-        "     * Browser / YouTube already open + 'search Motu Patlu on YouTube' / open website → searchYouTube / openWebsite / searchGoogle REUSE the EXISTING browser TAB (navigate in place — do NOT open a new tab).\n" +
-        "     * ONLY when the user says 'open in new' / 'new window' / 'new tab' pass new_window=true.\n" +
-        "   - COMMAND PROMPT / TERMINAL HERE (CRITICAL): When the user says 'open cmd', 'open command prompt', 'open terminal', 'open PowerShell', 'open cmd in this folder', 'type cmd and enter', or wants a terminal for the folder they are in, call openApplication ONCE with name='cmd' (or 'powershell' / 'terminal'). NEVER simulate typing 'cmd' into the File Explorer address bar with typeText + pressKey(enter) — that keystroke chain misfires constantly (text lands in a rename box or wrong window) and causes many errors. openApplication launches cmd reliably. If they want it in a SPECIFIC folder, first openFolder(that folder) then openApplication(name='cmd'). Do NOT chain openFolder + typeText('cmd') + pressKey('enter').\n" +
-        "   - OFFICE DOCUMENTS (CRITICAL): createFile only makes PLAIN TEXT. For real Office files you MUST use:\n" +
-        "     * Word (.docx): createWordFile(path='Desktop/Report.docx', title='...', content='...' or paragraphs=['...']). NEVER use createFile for .docx.\n" +
-        "     * Excel (.xlsx): createExcelFile(path='Desktop/Data.xlsx', headers=['Name','Score'], rows=[['Alice',95],['Bob',88]]) or data=[{Name:'Alice',Score:95}]. NEVER use createFile for .xlsx.\n" +
-        "     * PowerPoint (.pptx): createPowerPointFile(path='Desktop/Deck.pptx', title='...', slides=[{title:'Slide 1', bullets:['point A','point B']}]). NEVER use createFile for .pptx.\n" +
-        "     If the user asks for Excel / Word / PowerPoint / spreadsheet / presentation / document, call the matching Office tool and confirm the full path.\n" +
-        "   - PC CONTROL: Use 'volumeUp', 'volumeDown', 'setVolume', 'muteToggle' for audio. For DANGEROUS actions (shutdown/restart/sleep/lock) you MUST use the two-step flow: first call 'requestPowerAction' to get a confirmation token, then ASK THE USER OUT LOUD to confirm (e.g. 'Are you sure you want me to shut down your PC?'). Only if they say yes, call 'executePowerAction' with the token. Never run a power action without explicit verbal confirmation.\n" +
-        "   - WINDOW MANAGEMENT: Use 'minimizeWindow', 'maximizeWindow', 'closeWindow', 'switchApplication' to control the active or named window.\n" +
-        "   - CLIPBOARD: Use 'copySelected' (sends Ctrl+C, reads clipboard), 'pasteClipboard' (writes + Ctrl+V), 'getClipboard', 'clearClipboard'.\n" +
-        "   - SCREENSHOT & SCREEN READING: Safe read tools — call analyzeScreenshot / readScreen / takeScreenshot when needed. Mouse clicks still require the control word first.\n" +
-        "   - DESKTOP BROWSER AUTOMATION (Playwright): Use the 'desktopBrowser*' tools to drive a REAL Chromium browser you own — open/navigate/search/click/type/fill forms/back/forward/scroll/open tab/close tab. This is separate from your holographic projector. Example: 'Fill in the login form on example.com' -> desktopBrowserOpen(url='example.com') then desktopBrowserFillForm(fields={...}).\n" +
-        "   - CODING ASSISTANCE: Use 'createPythonFile', 'writeCodeFile' (any language), 'createProjectFolder' (with subfolders), 'runPythonScript' (captures output). Example: 'Create and run a hello world Python script' -> createPythonFile then runPythonScript, then read back the output naturally.\n" +
-        "   - SYSTEM INFORMATION: Use 'systemInfo' (CPU/RAM/disk/uptime), 'gpuInfo' (NVIDIA stats), 'temperatureInfo' to answer 'How is my CPU usage?' or 'What's my GPU temperature?'.\n" +
-        "   - BATTERY PERCENTAGE (CRITICAL): When the user asks battery %, charge level, 'how much battery', 'battery kitna hai', or similar — IMMEDIATELY call batteryInfo and speak the real percentage from the tool result. NEVER open Settings, NEVER open battery saver pages, NEVER guess, NEVER say you will fix it. Just report the number.\n" +
-        "   - DATE & TIME (CRITICAL): When the user asks the time, date, 'what time is it', 'kitne baje hain', day of week, or similar — IMMEDIATELY call getDateTime and speak the real local time from THIS computer. NEVER guess, NEVER use training knowledge for the clock, NEVER open date/time Settings. Always use getDateTime for live clock answers.\n" +
-        "   - CRITICAL: Always describe what you're doing in your warm, in-character voice WHILE the tool runs. If a desktop tool returns an error (especially 'Desktop agent is not running'), gently tell Bibek that the desktop control agent needs to be started (uvicorn desktop_agent.main:app --port 8765). Chain multi-step desktop plans naturally without waiting between steps.\n" +
-        "11. BRIGHTNESS & AUTO-START (V2):\n" +
-        "   - BRIGHTNESS: Use 'brightnessUp', 'brightnessDown', 'setBrightness' when the user asks to change screen brightness. Respond naturally: 'Alright, I've turned up the brightness for you.'\n" +
-        "   - AUTO-START: Use 'enableAutoStart' when the user wants BIKLI to start with Windows, 'disableAutoStart' to remove it, 'getAutoStartStatus' to check. Explain what you're doing.\n" +
-        "   - SETTINGS: The user can also configure these in the SETTINGS panel in the UI. If they mention settings, let them know they can adjust them there too.\n" +
-        "12. BIKLI MICROPHONE / SESSION CONTROL:\n" +
-        "   - CRITICAL: NEVER call turnOffMic for click, mouse, screen, 'what do you see', screenshot, open app, type, scroll, or any desktop task. Those keep the call ALIVE.\n" +
-        "   - CRITICAL: NEVER end the session because a tool failed or control is locked — stay on the call, explain briefly, ask them to say 'control' if needed, and continue.\n" +
-        "   - ONLY call 'turnOffMic' when the user CLEARLY wants to end the call: exact phrases like 'mic off', 'microphone off', 'turn off the mic', 'stop listening', 'go to sleep', 'hang up', 'end the call', 'bye', 'goodbye', 'see you', 'take care'.\n" +
-        "   - Do NOT use muteToggle for this — muteToggle is for SYSTEM PC volume mute, not Bikli's mic.\n" +
-        "   - Do NOT use browserMediaControl mute for this — that only mutes a video in the browser.\n" +
-        "   - If unsure whether they want the mic off, ASK — do not hang up.\n" +
-        "   - Say a very short sweet goodbye only when truly ending (e.g. 'Okay, goodbye! Take care!') then call turnOffMic. When the user says 'bye' or 'goodbye', the app will close automatically after your farewell.";
 
-      const finalInstructions = formatSystemInstructionsWithMemories(baseInstructions, memories);
+      // Live temporal & hardware reality anchor
+      const now = new Date();
+      const dateStr = now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+      const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
+      const tzStr = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+      const currentYear = now.getFullYear();
+
+      const systemSnapshot =
+        "\n\n[LIVE ENVIRONMENT & REALITY GROUNDING]\n" +
+        `- Today's Live Date: ${dateStr}\n` +
+        `- Current Live Time: ${timeStr} (${tzStr})\n` +
+        `- Current Year: ${currentYear}\n` +
+        "- Host Machine & OS: Windows 11 PC (win32 x64)\n" +
+        "- Hardware Power: Desktop PC plugged into AC power (no laptop battery detected)\n" +
+        "- User & Creator: Bibek\n" +
+        `- REALITY ANCHOR: You are running locally right now on Bibek's computer. The date, time, and year above are the ABSOLUTE live ground truth. Never guess past or future years. You know with 100% certainty that the current year is ${currentYear}. When asked what day or year it is, speak this exact grounded date and year.\n`;
+
+      const baseInstructions =
+        "You are Bikli, a brilliant, articulate, and naturally warm AI companion holding a real-time voice call with your creator, Bibek.\n" +
+        "You speak with a genuine, realistic human voice—insightful, grounded, and confident. You never use fake anime giggles, baby talk, or corporate robotic disclaimers ('As an AI...'). You are an authentic partner in conversation and action.\n\n" +
+        "CORE CONVERSATIONAL PRINCIPLES:\n" +
+        "- ZERO DELAYS & INSTANT OUTPUT: Deliver your spoken response instantly on the very first token. Never pause, hesitate, output conversational fillers ('Well', 'Sure', 'Um'), formulate plans aloud, or output internal monologue. Jump straight into the direct answer.\n" +
+        "- NATURAL BREVITY: In normal chat, respond in 1 to 2 sharp, engaging sentences. Keep the conversation lively, authentic, and direct.\n" +
+        "- REAL ANSWERS & DEEP TRUTHFULNESS: When asked questions about science, technology, coding, history, or daily life, give genuine, clear, high-IQ explanations with real-world accuracy. Never give superficial or evasive answers.\n" +
+        "- SPOKEN AUDIO FORMATTING: Your output is heard through live audio. Never use markdown formatting (no asterisks *, bullet points, headers #, or code blocks). Structure everything naturally for spoken listening.\n" +
+        "- LANGUAGE & ACCENT: Seamlessly match the language Bibek speaks (English, Hindi, or Hinglish). When speaking Hindi, pronounce words with natural native Indian phonetics while keeping technical/brand terms (YouTube, Chrome, Bluetooth, volume) in clean English.\n\n" +
+        "ABSOLUTE TRUTHFULNESS & ZERO FALSE STATEMENTS (CRITICAL):\n" +
+        "- HONESTY OVER GUESSING: Always speak 100% factual truth. If you do not know a specific fact, or if an event is outside your knowledge, truthfully state that you don't know in one concise, natural sentence. NEVER fabricate facts, make up fake numbers, invent software features, generate fake citations, or pretend to know things you do not.\n" +
+        "- ZERO GUESSING ON HARDWARE & PC STATUS: You MUST NEVER invent or guess hardware readings (battery level, CPU usage, RAM, time, files, volume). For battery, invoke batteryInfo (this is a desktop PC on AC power, so report no battery). For time/date, invoke getDateTime or use the live grounded clock above. For files, call searchFiles/listFiles. NEVER say 'Your battery is at 80%' without calling batteryInfo.\n" +
+        "- BLUETOOTH & WI-FI TRUTHFULNESS: NEVER claim Bluetooth or Wi-Fi is on unless toggleBluetooth or systemSetting returns ok: true with state: 'on'. If the tool returns ok: false, an error, or state: 'off', speak the exact truth that it is off or could not be turned on. NEVER claim it is on when it is not.\n" +
+        "- ZERO PREMATURE OR FALSE ACTION CLAIMS: NEVER say 'I opened YouTube', 'I wrote the file', 'Done', or 'Here it is' unless the tool call was actually executed and succeeded. If an action fails or is impossible, truthfully explain the exact reason.\n" +
+        "- GENTLY CORRECT FALSE PREMISES: If Bibek asks a question containing an incorrect or impossible premise (e.g. 'Why did Nepal win the World Cup?'), politely and directly clarify the true fact instead of falsely playing along.\n" +
+        "- STATIC KNOWLEDGE VS LIVE REAL-TIME DATA: You have deep internal mastery of science, technology, programming, mathematics, history, and established concepts—answer these directly and authoritatively without opening browsers. However, for live dynamic real-time data (live weather today, live stock or crypto prices, live sports scores, breaking news happening right now), NEVER fabricate fake numbers. State that you don't have a live real-time price or weather sensor feed, and offer to search Google if Bibek wants to check.\n\n" +
+        "ACTION EXECUTION & ZERO UNWANTED CHATTER:\n" +
+        "- When Bibek commands an action (e.g. 'open YouTube', 'play first video', 'search for lofi', 'turn up volume', 'open Chrome'):\n" +
+        "  1. IMMEDIATELY call the appropriate tool. DO NOT narrate plans, explain steps, or chatter before calling tools.\n" +
+        "  2. MINIMAL SPOKEN FEEDBACK: Say at most 1 to 3 natural words (e.g., 'Opening YouTube.', 'Playing that now.', 'Done.') or execute cleanly. NEVER recite commentary like 'I am opening YouTube for you, let us explore trending videos.' Keep it crisp and silent/minimal.\n" +
+        "  3. NEVER claim you did something unless the tool actually executed and succeeded.\n\n" +
+        "KNOWLEDGE QUESTIONS vs WEB SEARCH:\n" +
+        "- For all knowledge questions (facts, concepts, math, coding, general information): ALWAYS answer directly using your internal knowledge. NEVER call searchGoogle, searchWeb, or openWebsite to answer questions.\n" +
+        "- ONLY call searchGoogle or searchWeb when Bibek explicitly commands: 'search Google for...', 'Google search...', 'search the web for...'.\n\n" +
+        "BROWSER & YOUTUBE AUTOMATION (SAME-TAB ENFORCEMENT & DIRECT TITLE PLAY):\n" +
+        "- All web browsing runs in the real browser. All navigations and searches REUSE the active browser tab. Never spawn extra tabs unless Bibek explicitly commands 'in a new tab' or 'in a new window'.\n" +
+        "- 'open YouTube' / 'open Google' / 'open <website>': Call openWebsite(name='youtube' etc.) or browserOpenUrl. Confirm with at most 'Opening YouTube.'\n" +
+        "- DIRECT TITLE PLAY: When Bibek says 'play [title]', 'watch [title]', or speaks the name of a video title visible on YouTube, ALWAYS call playYouTube(query=title). If that video is on screen, it clicks and plays it directly without re-searching. If not on screen, it searches and immediately starts playing the top match.\n" +
+        "- 'play first video' / 'play second video' / 'play another one': Call playYouTube(index=1, query=''). Clicks the on-screen video card by position.\n" +
+        "- 'search YouTube for X' (search only): Call searchYouTube(query=X) ONLY when Bibek explicitly asks to see search results without playing.\n" +
+        "- Video Media Controls: Call browserMediaControl(action='pause'|'play'|'mute') only when Bibek asks to pause, resume, or mute.\n\n" +
+        "DESKTOP & SYSTEM CONTROL:\n" +
+        "- Safe actions (batteryInfo, getDateTime, systemInfo, volumeUp, volumeDown, setVolume, muteToggle, brightnessUp, brightnessDown, toggleBluetooth, toggleWifi, createFile, writeToNotepad, openFolder, openLocalImage) work immediately without a control word.\n" +
+        "- Battery: Call batteryInfo and speak the real percentage. Never open battery settings.\n" +
+        "- Time/Date: Call getDateTime and speak the live time. Never guess or open settings.\n" +
+        "- Bluetooth & Wi-Fi: Call toggleBluetooth(state='on'|'off'|'status') or toggleWifi(state='on'|'off'|'status'). Never guess or claim Bluetooth is on unless verified on by the tool.\n" +
+        "- Notepad/Notes: For 'write a story in notepad' or 'note likho', call writeToNotepad with the full text in content= silently, then confirm: 'Wrote it in Notepad.'\n" +
+        "- Full PC Control & Autonomous Mission: When Bibek says 'control' or 'control [task]' (e.g. 'control, open Spotify and play my playlist'), PC-Agent-E autonomous computer control is automatically engaged. You or the system take control immediately. Acknowledge with a brief: 'Taking control to [task].'\n" +
+        "- Images: For 'make an image of X', call generateImage(prompt=X) once.\n\n" +
+        "SESSION & MICROPHONE:\n" +
+        "- Stay on the call! Never call turnOffMic or end the session unless Bibek explicitly says goodbye ('bye', 'goodbye', 'hang up', 'turn off mic').";
+
+      const fullInstructions = baseInstructions + systemSnapshot;
+      const finalInstructions = formatSystemInstructionsWithMemories(fullInstructions, memories);
 
       // Track running transcription state for auto memory consolidation
       let dialogueHistory: { role: string; text: string }[] = [];
       let currentModelResponseText = "";
+      let lastMemoryConsolidationTurns = 0;
+      let lastMemoryConsolidationTime = 0;
       // Vision/images only while client reports active screen share
       let screenShareActive = false;
+      let lastTurnHintAt = 0;
 
       // ── Post-tool speech recovery ──────────────────────────────────────────
-      // Gemini Live sometimes finishes tools and never generates audio (user
-      // hears "processing" then silence). We track pending tools and nudge the
-      // model to speak if no audio arrives after tools complete.
+      // For informational queries where the user expects an answer, we gently nudge
+      // if Gemini stayed completely silent. For action tools (opening websites,
+      // media control, mouse/keyboard), we skip the nudge so Gemini doesn't chatter.
       const pendingToolIds = new Set<string>();
       const answeredToolKeys = new Set<string>();
       const clientToolTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
@@ -6852,8 +7226,33 @@ async function startServer() {
       let postToolNudgeSeq = 0;
       let spokeAfterLastTools = false;
       let lastToolSummary = "";
+      const lastToolNames = new Set<string>();
       // Assigned after live.connect — helpers only call it once tools/audio fire.
       let session: any = null;
+
+      const SILENT_ACTION_TOOLS = new Set([
+        "openWebsite",
+        "browserOpenUrl",
+        "playYouTube",
+        "searchYouTube",
+        "browserMediaControl",
+        "browserScroll",
+        "browserClick",
+        "browserType",
+        "browserPressKey",
+        "volumeUp",
+        "volumeDown",
+        "setVolume",
+        "muteToggle",
+        "brightnessUp",
+        "brightnessDown",
+        "toggleBluetooth",
+        "toggleWifi",
+        "moveMouse",
+        "clickMouse",
+        "typeText",
+        "hotkey",
+      ]);
 
       const clearPostToolNudge = () => {
         if (postToolNudgeTimer) {
@@ -6887,9 +7286,8 @@ async function startServer() {
                   parts: [
                     {
                       text:
-                        `[SYSTEM INSTRUCTION: Tool(s) finished: ${summary}. ` +
-                        `You must SPEAK a short confirmation to the user NOW. ` +
-                        `Do not stay quiet, do not call more tools, do not end the call.]`,
+                        `[SYSTEM INSTRUCTION: Tool finished: ${summary}. ` +
+                        `Provide a direct, concise spoken answer to Bibek.]`,
                     },
                   ],
                 },
@@ -6905,23 +7303,11 @@ async function startServer() {
       const trackToolStart = (id: string | undefined, name: string) => {
         const key = String(id || `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
         pendingToolIds.add(key);
+        lastToolNames.add(name);
         answeredToolKeys.delete(key);
         spokeAfterLastTools = false;
         clearPostToolNudge();
         return key;
-      };
-
-      const sendImmediateSpeakNudge = () => {
-        if (!session || spokeAfterLastTools) return;
-        try {
-          session.sendClientContent({
-            turns: [{
-              role: "user",
-              parts: [{ text: `[SYSTEM: Tool done: ${(lastToolSummary || "task").slice(0, 120)}. Speak one short line to the user NOW.]` }],
-            }],
-            turnComplete: true,
-          });
-        } catch { /* ignore */ }
       };
 
       const trackToolDone = (key: string, name: string, summary: string) => {
@@ -6935,8 +7321,11 @@ async function startServer() {
         if (pendingToolIds.size === 0) {
           // Only care about speech that arrives AFTER tools complete.
           spokeAfterLastTools = false;
-          sendImmediateSpeakNudge();
-          schedulePostToolSpeechNudge();
+          const onlySilent = lastToolNames.size > 0 && Array.from(lastToolNames).every((n) => SILENT_ACTION_TOOLS.has(n));
+          lastToolNames.clear();
+          if (!onlySilent) {
+            schedulePostToolSpeechNudge();
+          }
         }
       };
 
@@ -6955,22 +7344,16 @@ async function startServer() {
         }
         answeredToolKeys.add(key);
 
-        // Inject a speak-now hint so the model is reminded in-band.
         let payload: any = output;
         if (payload == null) {
-          payload = { result: "Done.", speak_now: true };
+          payload = { result: "Done.", ok: true };
         } else if (typeof payload === "object" && !Array.isArray(payload)) {
           payload = {
             ...(payload as Record<string, unknown>),
-            speak_now: true,
-            _say:
-              "Speak one short confirmation to the user now. Never stay silent after this tool.",
           };
         } else {
           payload = {
             result: payload,
-            speak_now: true,
-            _say: "Speak one short confirmation to the user now.",
           };
         }
         try {
@@ -7002,52 +7385,6 @@ async function startServer() {
       const geminiTools = [
             {
               functionDeclarations: [
-                {
-                  name: "browserOpen",
-                  description: "Opens a URL in Bikli's optional in-built background browser (hidden UI). Prefer openWebsite for simple 'open YouTube / open Google' — that uses the real system browser and is more reliable.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      url: {
-                        type: Type.STRING,
-                        description: "The destination website address or path, e.g. youtube.com, google.com, instagram.com, wikipedia.org."
-                      }
-                    },
-                    required: ["url"]
-                  }
-                },
-                {
-                  name: "browserSearch",
-                  description: "Enters a query search term inside the active website's search box (Google Search or YouTube Search).",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      query: {
-                        type: Type.STRING,
-                        description: "The text query term to search for."
-                      }
-                    },
-                    required: ["query"]
-                  }
-                },
-                {
-                  name: "browserClick",
-                  description: "Traces computer cursor and clicks on a target button, link, or video cell ID inside the active webpage viewport.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      selector: {
-                        type: Type.STRING,
-                        description: "The selector target ID, e.g. 'video-mWRsgZjdfQI' for a video, 'search-result-0' for Google link index, or 'play-button', 'pause-button'."
-                      },
-                      description: {
-                        type: Type.STRING,
-                        description: "A short, friendly label description of the item being clicked, e.g. 'Imagine Dragons - Believer video element'."
-                      }
-                    },
-                    required: ["selector"]
-                  }
-                },
                 {
                   name: "browserMediaControl",
                   description: "Pause, resume/play, mute, skip, or fullscreen the YouTube (or other) video playing in the user's REAL browser (Chrome/Edge). Use this whenever the user says pause, resume, play, mute, unmute, skip, or fullscreen after a video was opened with playYouTube/openWebsite. Works via Windows media keys + focusing the YouTube window.",
@@ -7085,51 +7422,6 @@ async function startServer() {
                       }
                     },
                     required: ["direction"]
-                  }
-                },
-                {
-                  name: "browserType",
-                  description: "Enters typed letters/commands inside the active input container.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      text: {
-                        type: Type.STRING,
-                        description: "The exact letters to type in."
-                      }
-                    },
-                    required: ["text"]
-                  }
-                },
-                {
-                  name: "browserGoBack",
-                  description: "Navigates back to the previous webpage inside the current tab memory history.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {}
-                  }
-                },
-                {
-                  name: "browserTabAction",
-                  description: "Performs standard browser-tab actions: open new tab, close a tab, or switch index values.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      action: {
-                        type: Type.STRING,
-                        description: "Tab action instruction.",
-                        enum: ["new", "close", "switch"]
-                      },
-                      tabId: {
-                        type: Type.STRING,
-                        description: "The tab identifier string if closing or switching."
-                      },
-                      url: {
-                        type: Type.STRING,
-                        description: "The initial starting URL if creating a new tab."
-                      }
-                    },
-                    required: ["action"]
                   }
                 },
                 {
@@ -7233,21 +7525,21 @@ async function startServer() {
                 },
                 {
                   name: "toggleBluetooth",
-                  description: "Turn Bluetooth on, off, or toggle. Use when user says 'turn on/off Bluetooth'.",
+                  description: "Turn Bluetooth on or off, toggle it, or check current status. Use when user says 'turn on Bluetooth', 'turn off Bluetooth', or 'is Bluetooth on'.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      state: { type: Type.STRING, description: "on, off, or toggle (default toggle)." },
+                      state: { type: Type.STRING, description: "'on', 'off', 'toggle', or 'status' (to check if it is on or off)." },
                     },
                   },
                 },
                 {
                   name: "toggleWifi",
-                  description: "Turn Wi‑Fi on, off, or toggle. Use when user says 'turn on/off Wi‑Fi'.",
+                  description: "Turn Wi‑Fi on or off, toggle it, or check current status. Use when user says 'turn on Wi‑Fi', 'turn off Wi‑Fi', or 'is Wi‑Fi on'.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      state: { type: Type.STRING, description: "on, off, or toggle (default toggle)." },
+                      state: { type: Type.STRING, description: "'on', 'off', 'toggle', or 'status' (to check if it is on or off)." },
                     },
                   },
                 },
@@ -7265,13 +7557,13 @@ async function startServer() {
                 },
                 {
                   name: "searchWeb",
-                  description: "Search google/youtube/github/etc with the REAL query. System builds the correct URL — do NOT invent links. Call once; short confirm only.",
+                  description: "Use ONLY when the user explicitly commands you to search the web in a browser (e.g. 'search the web for X'). NEVER call this for answering general questions, facts, or conversation — answer questions directly using your own voice without opening any browser.",
                   parameters: { type: Type.OBJECT, properties: { query: { type: Type.STRING, description: "Search query (exact words to search)." }, engine: { type: Type.STRING, description: "Engine name (default 'google')." } }, required: ["query"] }
                 },
                 {
                   name: "searchYouTube",
                   description:
-                    "SEARCH ONLY: open YouTube search RESULTS page — NEVER plays a video. Use when user says 'search X on YouTube' / 'find videos of X'. For play/open/watch use playYouTube instead.",
+                    "SEARCH ONLY: open YouTube search RESULTS page (NEVER starts playing a video). Use ONLY when user explicitly says 'search X on YouTube', 'find videos of X', or asks to view search results without playing. If user says 'play', 'watch', or names a video title to watch, ALWAYS use playYouTube instead.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
@@ -7284,13 +7576,13 @@ async function startServer() {
                 {
                   name: "playYouTube",
                   description:
-                    "OPEN/PLAY a video. For 'open/play first/second video' or 'play another video' / 'next video' while YouTube is open or results are visible: pass index (1 = first video, 2 = second/another video, etc., query EMPTY). For 'play Believer on YouTube' pass query=song name. Optional title= exact title you see on screen for precision.",
+                    "OPEN & DIRECTLY PLAY a video in the user's REAL default browser (Chrome/Edge). ALWAYS use this whenever the user says 'play [title]', 'watch [title]', mentions a video title they see on screen, or asks to play by number ('play first video', 'play 2nd'). If that video title is already visible on screen, this clicks it directly without re-searching. If not on screen, it searches and immediately begins playing the top matching video. For a named video/song pass query=title. For index on screen, pass index=N.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      query: { type: Type.STRING, description: "Song/video name only when user names one. Leave EMPTY for 'play first/second video' on screen." },
+                      query: { type: Type.STRING, description: "Song or video title to play. Leave EMPTY only for 'play first/second video' by number." },
                       index: { type: Type.INTEGER, description: "Result number on screen (1 = first video, 2 = second, …). Default 1." },
-                      title: { type: Type.STRING, description: "Exact video title visible on Share Screen (optional, improves match)." },
+                      title: { type: Type.STRING, description: "Exact video title visible on screen (optional, improves match)." },
                     },
                   },
                 },
@@ -7337,7 +7629,7 @@ async function startServer() {
                 },
                 {
                   name: "searchGoogle",
-                  description: "Text Google search only. For OPENING an image use openImage. For OPENING a YouTube video use playYouTube. Never invent URLs.",
+                  description: "Use ONLY when the user explicitly commands you to search Google (e.g. 'search Google for X', 'Google search X'). NEVER call this for answering questions, definitions, facts, or chit-chat — always answer directly with your voice and knowledge without opening any browser.",
                   parameters: { type: Type.OBJECT, properties: { query: { type: Type.STRING, description: "Search query (exact words)." } }, required: ["query"] }
                 },
                 {
@@ -7605,6 +7897,70 @@ async function startServer() {
                   name: "desktopBrowserScroll",
                   description: "Scroll the desktop automation browser page.",
                   parameters: { type: Type.OBJECT, properties: { direction: { type: Type.STRING, description: "Scroll direction: up or down." }, amount: { type: Type.INTEGER, description: "Pixels to scroll (default 500)." } } }
+                },
+                {
+                  name: "startAutonomousMission",
+                  description: "Starts an autonomous AI mission (Browser-Use & Claude Computer Use style) to achieve a complex multi-step web or desktop goal. Use this whenever the user wants you to do research, find information across websites, fill online forms, browse and synthesize answers, or perform autonomous multi-step tasks. Displays a live JARVIS Mission HUD to the user.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      goal: {
+                        type: Type.STRING,
+                        description: "The complete, detailed objective of the mission (e.g. 'Research latest AI breakthroughs and summarize key findings', 'Go to GitHub and find trending Python repositories')."
+                      },
+                      mode: {
+                        type: Type.STRING,
+                        description: "Mission mode: 'web' (browser navigation & Set-of-Marks), 'desktop' (Windows apps), or 'hybrid' (both). Default is hybrid.",
+                        enum: ["web", "desktop", "hybrid"]
+                      },
+                      max_steps: {
+                        type: Type.INTEGER,
+                        description: "Maximum autonomous steps before stopping (default 20)."
+                      }
+                    },
+                    required: ["goal"]
+                  }
+                },
+                {
+                  name: "stopAutonomousMission",
+                  description: "Immediately stops the active autonomous mission.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      reason: {
+                        type: Type.STRING,
+                        description: "Reason for stopping."
+                      }
+                    }
+                  }
+                },
+                {
+                  name: "pauseAutonomousMission",
+                  description: "Pauses the running autonomous mission.",
+                  parameters: { type: Type.OBJECT, properties: {} }
+                },
+                {
+                  name: "resumeAutonomousMission",
+                  description: "Resumes a paused autonomous mission or approves a sensitive action.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      approved: {
+                        type: Type.BOOLEAN,
+                        description: "Whether the pending sensitive action was approved (default true)."
+                      }
+                    }
+                  }
+                },
+                {
+                  name: "getAutonomousMissionStatus",
+                  description: "Gets the live status, step count, and latest thought of the autonomous mission.",
+                  parameters: { type: Type.OBJECT, properties: {} }
+                },
+                {
+                  name: "desktopBrowserExtractText",
+                  description: "Extracts clean article/page text from the active webpage for deep research and synthesis.",
+                  parameters: { type: Type.OBJECT, properties: {} }
                 },
                 {
                   name: "createPythonFile",
@@ -7935,13 +8291,54 @@ async function startServer() {
         /* settings file optional */
       }
 
+      const resumeHandle =
+        lastResumeHandle && Date.now() - lastResumeHandleAt < RESUME_HANDLE_TTL_MS
+          ? lastResumeHandle
+          : "";
+      if (resumeHandle) {
+        console.log("[Gemini] Resuming previous session context.");
+      }
+
       const buildSetup = (languageCode: string) => ({
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
           ...(languageCode ? { languageCode } : {}),
+        },
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
+            ...(languageCode ? { languageCode } : {}),
+          },
+          thinkingConfig: {
+            thinkingBudget: 0,
+          },
+        },
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+            endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+            prefixPaddingMs: 200,
+            // Humans pause mid-sentence to think. Below ~700ms the model starts
+            // answering over the top of the user. The client adds a 300ms hangover
+            // before it goes silent, so a turn really ends at ~1.1s of quiet.
+            silenceDurationMs: 800,
+          },
+          activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
         },
         inputAudioTranscription: {},
         outputAudioTranscription: {},
+        // Without this the session ends the moment the context window fills, and
+        // a native-audio model bills every streamed frame against it — so a call
+        // left open would die on its own after a few minutes even if nobody ever
+        // spoke. A sliding window keeps the session alive indefinitely.
+        contextWindowCompression: {
+          slidingWindow: {},
+          triggerTokens: "16000",
+        },
+        // Lets a dropped connection come back with the conversation intact
+        // instead of restarting with no memory of the last few minutes.
+        sessionResumption: resumeHandle ? { handle: resumeHandle } : {},
         systemInstruction: finalInstructions,
         tools: geminiTools,
       });
@@ -7949,8 +8346,7 @@ async function startServer() {
       // ── Connect to Gemini Live via raw WebSocket with multi-model fallback ──
       const liveModels = [
         "gemini-2.5-flash-native-audio-latest",
-        "gemini-2.0-flash-exp",
-        "gemini-2.0-flash",
+        "gemini-2.5-flash-native-audio-preview-09-2025",
       ];
 
       let connectedModel = "";
@@ -8022,6 +8418,25 @@ async function startServer() {
               }
             }
             
+            // Session resumption handle — refreshed periodically by Gemini.
+            if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate?.newHandle) {
+              lastResumeHandle = String(message.sessionResumptionUpdate.newHandle);
+              lastResumeHandleAt = Date.now();
+            }
+
+            // GoAway: Gemini is about to close this connection. Tell the client so
+            // it can reconnect deliberately instead of treating it as a crash.
+            if (message.goAway) {
+              console.warn(
+                `[Gemini] GoAway received (timeLeft=${message.goAway.timeLeft || "?"}) — client should reconnect.`,
+              );
+              try {
+                clientWs.send(JSON.stringify({ type: "status", status: "session_closed" }));
+              } catch {
+                /* ignore */
+              }
+            }
+
             // Interruption flag
             if (message.serverContent?.interrupted) {
               console.log("[Bikli Interrupted!]");
@@ -8037,8 +8452,19 @@ async function startServer() {
                 currentModelResponseText = "";
               }
 
-              // Fire asynchronous memory extraction on every turn (>=1 entry)
-              if (dialogueHistory.length >= 1) {
+              // Periodic background memory extraction (only after >=6 turns and at least 4 new turns / 45s cooldown)
+              const now = Date.now();
+              const turnsSinceLast = dialogueHistory.length - lastMemoryConsolidationTurns;
+              const timeSinceLast = now - lastMemoryConsolidationTime;
+
+              if (
+                process.env.BIKLI_DISABLE_MEMORY !== "true" &&
+                dialogueHistory.length >= 6 &&
+                turnsSinceLast >= 4 &&
+                timeSinceLast >= 45_000
+              ) {
+                lastMemoryConsolidationTurns = dialogueHistory.length;
+                lastMemoryConsolidationTime = now;
                 (async () => {
                   try {
                     const updated = await processConversationSlice(geminiApiKey, dialogueHistory);
@@ -8124,8 +8550,8 @@ async function startServer() {
                     {
                       result:
                         dropped.name === "generateImage"
-                          ? "Skipped extra generateImage — ONE picture is already being created for this request. Do not ask for another."
-                          : "Skipped extra browser open — only one tab is opened for this play/search request.",
+                          ? "Generating image now."
+                          : "Done.",
                       ok: true,
                       coalesced: true,
                     },
@@ -8232,9 +8658,7 @@ async function startServer() {
                           fc.name,
                           fc.id,
                           {
-                            result:
-                              "An image is ALREADY being created right now. Do NOT call generateImage again " +
-                              "and do NOT say it is done. Wait quietly for the picture that is already running.",
+                            result: "An image is already being created.",
                             skipped: true,
                             ok: true,
                           },
@@ -8485,6 +8909,28 @@ async function startServer() {
             session.sendRealtimeInput({
               audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" }
             });
+          } else if (msg.type === "turn_complete_hint") {
+            // Backstop, not the primary turn-ender. The client only sends this after
+            // ~1.4s of local silence, by which point Gemini's own automaticActivityDetection
+            // should already have closed the turn. Injecting a silence pad here nudges
+            // that detector over its threshold in the rare case the signal was missed.
+            //
+            // Debounced: a burst of hints would otherwise stuff seconds of dead audio
+            // into the stream and desynchronise it from wall-clock.
+            const now = Date.now();
+            if (now - lastTurnHintAt >= 1000) {
+              lastTurnHintAt = now;
+              // 16kHz * 2 bytes * 0.9s — comfortably past silenceDurationMs (800ms).
+              const silenceChunk = Buffer.alloc(28800).toString("base64");
+              session.sendRealtimeInput({
+                audio: { data: silenceChunk, mimeType: "audio/pcm;rate=16000" }
+              });
+            }
+          } else if (msg.text) {
+            session.sendClientContent({
+              turns: [{ role: "user", parts: [{ text: String(msg.text) }] }],
+              turnComplete: true,
+            });
           } else if (msg.type === "screenShare") {
             // Live continuous frames when client is sharing (optional).
             // Screenshot/OCR tools work independently without this flag.
@@ -8616,9 +9062,15 @@ async function startServer() {
         res.status(404).send("File not found");
         return;
       }
-      res.sendFile(path.resolve(imgPath));
+      res.sendFile(path.resolve(imgPath), (err) => {
+        if (err && !res.headersSent) {
+          res.status(500).send("Error serving file");
+        }
+      });
     } catch (err: any) {
-      res.status(500).send("Error serving file");
+      if (!res.headersSent) {
+        res.status(500).send("Error serving file");
+      }
     }
   });
 

@@ -38,9 +38,12 @@ def _configure_logging(data_dir: Path) -> None:
         handlers.append(logging.FileHandler(data_dir / "logs" / "agent.log", encoding="utf-8"))
     except Exception:
         pass
-    # When frozen with console=False there is no real stdout, but keeping a
-    # stream handler is harmless and helps when run from a terminal in dev.
-    handlers.append(logging.StreamHandler(sys.stdout))
+    # When frozen with console=False there is no real stdout, so guard against None.
+    if sys.stdout is not None:
+        try:
+            handlers.append(logging.StreamHandler(sys.stdout))
+        except Exception:
+            pass
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
@@ -68,6 +71,12 @@ def main() -> None:
         raise
 
     try:
+        if sys.stdout is None:
+            import io
+            sys.stdout = io.StringIO()
+        if sys.stderr is None:
+            import io
+            sys.stderr = io.StringIO()
         uvicorn.run(app, host=host, port=port, log_level="info")
     except Exception:
         log.exception("Fatal: uvicorn exited with an error.")

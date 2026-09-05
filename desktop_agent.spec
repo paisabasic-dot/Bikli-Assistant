@@ -45,6 +45,10 @@ hiddenimports += [
     # generateImage — omitting it here is why frozen agents answered
     # "Unknown tool 'generateImage'" and Bikli claimed she could not make images.
     "desktop_agent.tools_image",
+    # Autonomous Vision & Web Agent (Browser-Use + Claude Computer Use)
+    "desktop_agent.browser_vision_marks",
+    "desktop_agent.autonomous_engine",
+    "desktop_agent.tools_autonomous",
 ]
 
 # Web stack — uvicorn pulls its loop/protocol/lifespan submodules dynamically.

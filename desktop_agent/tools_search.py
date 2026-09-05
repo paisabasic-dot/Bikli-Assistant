@@ -350,6 +350,20 @@ def play_youtube(args: Dict[str, Any]) -> Dict[str, Any]:
             "debounced": True,
         }
 
+    # Primary: click the exact on-screen video card via agent-browser in the same tab
+    try:
+        from .tools_agent_browser import browser_play_youtube
+        res = browser_play_youtube(query=requested or query, index=index, prefer_on_screen=True)
+        if res and res.get("result"):
+            _LAST_YT_QUERY = query
+            _LAST_PLAYED_TITLE = res.get("title") or ""
+            _LAST_PLAY_KEY = play_key
+            _LAST_PLAY_AT = time.time()
+            return res
+    except Exception as e:
+        # Soft fallback to HTTP scraping if agent-browser is not installed
+        pass
+
     try:
         results = _fetch_youtube_results(query, limit=max(15, index))
     except (urllib.error.URLError, TimeoutError, OSError) as e:

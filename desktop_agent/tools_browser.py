@@ -85,14 +85,44 @@ async def _ensure_browser_async() -> Any:
             STATE.playwright = await async_playwright().start()
 
         if STATE.browser is None:
-            STATE.browser = await STATE.playwright.chromium.launch(
-                headless=False,
-                args=["--start-maximized", "--no-sandbox"],
+            # Stealth args to bypass bot detection (Browser-Use style)
+            launch_args = [
+                "--start-maximized",
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ]
+            try:
+                STATE.browser = await STATE.playwright.chromium.launch(
+                    channel="msedge",
+                    headless=False,
+                    args=launch_args,
+                )
+            except Exception:
+                STATE.browser = await STATE.playwright.chromium.launch(
+                    headless=False,
+                    args=launch_args,
+                )
+            user_agent = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
             )
-            STATE.context = await STATE.browser.new_context(viewport=None)
-
-        if STATE.context is None:
-            STATE.context = await STATE.browser.new_context(viewport=None)
+            STATE.context = await STATE.browser.new_context(
+                viewport=None,
+                user_agent=user_agent,
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+            # Remove navigator.webdriver for stealth
+            await STATE.context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
 
         pages = STATE.context.pages
         if pages:
@@ -321,6 +351,23 @@ async def browser_scroll(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+@register("desktopBrowserExtractText")
+async def browser_extract_text(args: Dict[str, Any]) -> Dict[str, Any]:
+    page = await _page()
+    try:
+        text = await page.evaluate("""
+            (() => {
+                const clone = document.body.cloneNode(true);
+                clone.querySelectorAll('script, style, noscript, svg, nav, footer, header').forEach(el => el.remove());
+                return clone.innerText.replace(/\\n\\s*\\n/g, '\\n').trim().substring(0, 8000);
+            })()
+        """)
+        title = await page.title()
+        return {"result": f"Extracted text from {title} ({page.url}):\\n{text}", "title": title, "url": page.url, "text": text}
+    except Exception as e:
+        raise ToolError(f"Failed to extract page text: {e}")
+
+
 # Wrap the async handlers so FastAPI's sync threadpool path can call them.
 # Each @register'd async function above is replaced by a sync wrapper below.
 def _sync_wrap(async_fn):
@@ -348,6 +395,7 @@ for _name in [
     "desktopBrowserGoBack",
     "desktopBrowserGoForward",
     "desktopBrowserScroll",
+    "desktopBrowserExtractText",
 ]:
     _orig = TOOLS[_name]
     if asyncio.iscoroutinefunction(_orig):

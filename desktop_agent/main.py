@@ -12,6 +12,9 @@ or:
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import json
 import logging
 import os
 import sys
@@ -21,9 +24,11 @@ from typing import Any, Dict
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import __version__
+from .autonomous_engine import AUTONOMOUS_ENGINE
 from .registry import CONTROL_ALWAYS_ALLOWED, DESKTOP_TOOL_NAMES, STATE, TOOLS, ToolError, load_all
 
 logging.basicConfig(
@@ -118,8 +123,73 @@ def list_tools() -> Dict[str, Any]:
     return {"tools": sorted(TOOLS.keys()), "count": len(TOOLS)}
 
 
+class MissionStartRequest(BaseModel):
+    goal: str
+    mode: str = "hybrid"
+    max_steps: int = 20
+
+
+class MissionResumeRequest(BaseModel):
+    approved: bool = True
+
+
+class MissionStopRequest(BaseModel):
+    reason: str = "User stopped mission"
+
+
+@app.post("/mission/start")
+async def api_mission_start(req: MissionStartRequest) -> Dict[str, Any]:
+    return await AUTONOMOUS_ENGINE.start_mission(goal=req.goal, mode=req.mode, max_steps=req.max_steps)
+
+
+@app.post("/mission/stop")
+async def api_mission_stop(req: MissionStopRequest) -> Dict[str, Any]:
+    return await AUTONOMOUS_ENGINE.stop_mission(reason=req.reason)
+
+
+@app.post("/mission/pause")
+async def api_mission_pause() -> Dict[str, Any]:
+    return await AUTONOMOUS_ENGINE.pause_mission()
+
+
+@app.post("/mission/resume")
+async def api_mission_resume(req: MissionResumeRequest) -> Dict[str, Any]:
+    return await AUTONOMOUS_ENGINE.resume_mission(approved=req.approved)
+
+
+@app.get("/mission/status")
+def api_mission_status() -> Dict[str, Any]:
+    return AUTONOMOUS_ENGINE.get_status()
+
+
+@app.get("/mission/events")
+async def api_mission_events() -> StreamingResponse:
+    async def event_generator():
+        q = AUTONOMOUS_ENGINE.subscribe()
+        try:
+            init_data = json.dumps({"type": "init", "mission": AUTONOMOUS_ENGINE.get_status()})
+            yield f"data: {init_data}\n\n"
+            while True:
+                evt = await q.get()
+                yield f"data: {json.dumps(evt)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            AUTONOMOUS_ENGINE.unsubscribe(q)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/execute", response_model=ExecuteResponse)
-def execute(req: ExecuteRequest) -> ExecuteResponse:
+async def execute(req: ExecuteRequest) -> ExecuteResponse:
     tool = req.tool
     args = req.args or {}
     log.info("EXEC tool=%s args=%s", tool, _short_args(args))
@@ -149,7 +219,12 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
 
     handler = TOOLS[tool]
     try:
-        out = handler(args)
+        if inspect.iscoroutinefunction(handler):
+            out = await handler(args)
+        else:
+            out = handler(args)
+            if asyncio.iscoroutine(out):
+                out = await out
     except ToolError as e:
         log.warning("ToolError in %s: %s", tool, e.message)
         return ExecuteResponse(ok=False, error=e.message, tool=tool)

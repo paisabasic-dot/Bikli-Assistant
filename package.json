@@ -26,10 +26,12 @@
       "output": "release",
       "buildResources": "build"
     },
+    "icon": "build/icon.ico",
     "files": [
       "electron/**/*",
       "dist/**/*",
       "assets/**/*",
+      "build/**/*",
       "package.json",
       ".env",
       "!**/*.map",
@@ -45,9 +47,17 @@
           "!**/*.pdb",
           "!**/__pycache__{,/**/*}"
         ]
+      },
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",
@@ -94,12 +104,15 @@
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "agent-browser": "^0.36.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
+    "mmd-parser": "^1.0.4",
     "motion": "^12.23.24",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
+    "three": "^0.180.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
@@ -107,6 +120,7 @@
     "@types/node": "^22.14.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.180.0",
     "@types/ws": "^8.18.1",
     "autoprefixer": "^10.4.21",
     "electron": "^43.1.0",

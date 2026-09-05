@@ -15,6 +15,14 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+const _currentDir =
+  typeof __dirname !== "undefined"
+    ? __dirname
+    : typeof process !== "undefined"
+      ? process.cwd()
+      : ".";
 
 /**
  * Read-only app root (code + bundled assets). Prefer BIKLI_APP_ROOT from
@@ -49,8 +57,37 @@ export function resolveFrozenAgentExe(): string | undefined {
       : "",
     path.join(APP_ROOT, "agent_dist", "bikli-agent", "bikli-agent.exe"),
     path.join(APP_ROOT, "agent_dist", "bikli-agent.exe"),
+    path.join(_currentDir, "agent_dist", "bikli-agent", "bikli-agent.exe"),
+    path.join(_currentDir, "agent_dist", "bikli-agent.exe"),
+    path.join(_currentDir, "..", "agent_dist", "bikli-agent", "bikli-agent.exe"),
+    path.join(_currentDir, "..", "agent_dist", "bikli-agent.exe"),
     path.join(process.cwd(), "agent_dist", "bikli-agent", "bikli-agent.exe"),
     path.join(process.cwd(), "agent_dist", "bikli-agent.exe"),
+  ].filter(Boolean) as string[];
+
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) return c;
+    } catch {
+      /* ignore */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Locate the bundled agent-browser CLI executable.
+ */
+export function resolveAgentBrowserExe(): string | undefined {
+  const exeName = process.platform === "win32" ? "agent-browser.exe" : "agent-browser";
+  const candidates = [
+    process.env.AGENT_BROWSER_PATH,
+    process.env.BIKLI_APP_ROOT ? path.join(path.dirname(process.env.BIKLI_APP_ROOT), "bin", exeName) : "",
+    path.join(APP_ROOT, "bin", exeName),
+    path.join(_currentDir, "bin", exeName),
+    path.join(process.cwd(), "bin", exeName),
+    path.join(path.dirname(process.execPath), "bin", exeName),
+    path.join(path.dirname(APP_ROOT), "bin", exeName),
   ].filter(Boolean) as string[];
 
   for (const c of candidates) {

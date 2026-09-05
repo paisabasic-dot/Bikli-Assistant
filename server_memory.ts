@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import path from "path";
 import { randomUUID } from "crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import { Memory, MemoryTransaction } from "./src/lib/memoryTypes";
@@ -29,6 +30,9 @@ export async function loadMemories(): Promise<Memory[]> {
 }
 
 export async function saveMemories(memories: Memory[]): Promise<void> {
+  try {
+    await fs.mkdir(path.dirname(MEMORY_FILE), { recursive: true });
+  } catch {}
   await fs.writeFile(MEMORY_FILE, JSON.stringify(memories, null, 2), "utf-8");
   console.log(`[Memory] Saved ${memories.length} memories successfully.`);
 }
@@ -119,8 +123,17 @@ export function formatSystemInstructionsWithMemories(baseInstruction: string, me
   return baseInstruction + memoryBlock;
 }
 
-// Background memory consolidation queue lock
+// Background memory consolidation queue lock & rate-limit cooldown
 let isConsolidating = false;
+let memoryCooldownUntil = 0;
+
+const MEMORY_CANDIDATE_MODELS = [
+  process.env.GEMINI_MEMORY_MODEL,
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-flash-lite-latest",
+  "gemini-3.5-flash",
+].filter(Boolean) as string[];
 
 export async function processConversationSlice(
   apiKey: string,
@@ -131,7 +144,11 @@ export async function processConversationSlice(
     return null;
   }
 
-  if (dialogueHistory.length < 2) {
+  if (Date.now() < memoryCooldownUntil) {
+    return null;
+  }
+
+  if (dialogueHistory.length < 4) {
     return null;
   }
 
@@ -176,54 +193,68 @@ ${dialogueContext}
 - TEXT STYLE: Express the memories as clean, concise, third-person declarative summaries (e.g., 'The user is building a startup named Bikli.', 'The user loves playing GTA 6.', 'The user enjoys technical and fast-paced styling explanations.'). Do not include conversational filler, quotes, or timestamps.
 - ID: For ADD, leave blank. For UPDATE or REMOVE, provide the exact 'id' from the "Current user memories" list.`;
 
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              transactions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    action: {
-                      type: Type.STRING,
-                      description: "ADD, UPDATE, or REMOVE transaction.",
-                      enum: ["ADD", "UPDATE", "REMOVE"]
+    let response: any = null;
+    let chosenModel = "";
+
+    for (const modelName of MEMORY_CANDIDATE_MODELS) {
+      try {
+        response = await ai.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                transactions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      action: {
+                        type: Type.STRING,
+                        description: "ADD, UPDATE, or REMOVE transaction.",
+                        enum: ["ADD", "UPDATE", "REMOVE"]
+                      },
+                      id: {
+                        type: Type.STRING,
+                        description: "Specific ID of the existing memory being modified or deleted (leave blank/null for ADD)."
+                      },
+                      category: {
+                        type: Type.STRING,
+                        description: "The Memory category classification.",
+                        enum: ["identity", "preference", "goal", "project", "relationship", "emotional", "behavior"]
+                      },
+                      text: {
+                        type: Type.STRING,
+                        description: "The memory summarized as a concise declarative statement in third-person."
+                      }
                     },
-                    id: {
-                      type: Type.STRING,
-                      description: "Specific ID of the existing memory being modified or deleted (leave blank/null for ADD)."
-                    },
-                    category: {
-                      type: Type.STRING,
-                      description: "The Memory category classification.",
-                      enum: ["identity", "preference", "goal", "project", "relationship", "emotional", "behavior"]
-                    },
-                    text: {
-                      type: Type.STRING,
-                      description: "The memory summarized as a concise declarative statement in third-person."
-                    }
-                  },
-                  required: ["action", "category", "text"]
+                    required: ["action", "category", "text"]
+                  }
                 }
-              }
-            },
-            required: ["transactions"]
+              },
+              required: ["transactions"]
+            }
           }
+        });
+        chosenModel = modelName;
+        break;
+      } catch (modelErr: any) {
+        const msg = String(modelErr?.message || modelErr);
+        const isQuota = msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("Quota exceeded");
+        if (isQuota) {
+          memoryCooldownUntil = Date.now() + 120_000;
+          console.warn(`[Memory] Gemini quota reached (${modelName}). Pausing background consolidation for 2 minutes to protect voice chat.`);
+          return null;
         }
-      });
-    } catch (modelErr: any) {
-      console.warn("[Memory] gemini-2.0-flash failed, trying gemini-1.5-flash fallback:", modelErr?.message || modelErr);
-      response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: prompt,
-      });
+        // If 404 or 503, try next candidate model
+        continue;
+      }
+    }
+
+    if (!response || !response.text) {
+      return null;
     }
 
     const resultText = (response.text?.trim()) || "{}";
