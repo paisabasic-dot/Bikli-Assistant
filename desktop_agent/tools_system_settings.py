@@ -174,26 +174,37 @@ def _set_radio(kind: str, turn_on: bool) -> str:
 
 def _toggle_or_set_radio(kind: str, want: Optional[bool]) -> str:
     """
-    On/off/toggle in a single PowerShell launch.
-    Avoids double PS cold-start (status + set) that made Bluetooth feel frozen.
+    On/off/toggle in a single PowerShell launch with state verification.
     """
     if want is True:
-        target_expr = "'On'"
+        target_expr = "[Windows.Devices.Radios.RadioState]::On"
+        expected = "On"
     elif want is False:
-        target_expr = "'Off'"
+        target_expr = "[Windows.Devices.Radios.RadioState]::Off"
+        expected = "Off"
     else:
-        target_expr = "if ($r.State.ToString() -eq 'On') { 'Off' } else { 'On' }"
+        target_expr = "if ($r.State -eq [Windows.Devices.Radios.RadioState]::On) { [Windows.Devices.Radios.RadioState]::Off } else { [Windows.Devices.Radios.RadioState]::On }"
+        expected = None
     ps = (
         _RADIO_PS_PREAMBLE
         + f"$r = $radios | Where-Object {{ $_.Kind -eq '{kind}' }} | Select-Object -First 1; "
         + "if (-not $r) { Write-Output 'MISSING'; exit 1 }; "
         + f"$target = {target_expr}; "
-        + "$null = Await ($r.SetStateAsync($target)) ([Windows.Devices.Radios.RadioAccessStatus]); "
-        + "Write-Output $r.State.ToString()"
+        + "$status = Await ($r.SetStateAsync($target)) ([Windows.Devices.Radios.RadioAccessStatus]); "
+        + "if ($status -ne [Windows.Devices.Radios.RadioAccessStatus]::Allowed) { Write-Output ('DENIED_' + $status.ToString()); exit 1 }; "
+        + "Start-Sleep -Milliseconds 300; "
+        + f"$radios2 = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]]); "
+        + f"$r2 = $radios2 | Where-Object {{ $_.Kind -eq '{kind}' }} | Select-Object -First 1; "
+        + "if ($r2) { Write-Output $r2.State.ToString() } else { Write-Output $r.State.ToString() }"
     )
-    out = _run_ps(ps, timeout=10)
+    out = _run_ps(ps, timeout=10).strip()
     if out.upper() == "MISSING":
         raise ToolError(f"No {kind} radio found on this device.")
+    if out.startswith("DENIED_"):
+        status_name = out.split("_", 1)[1]
+        raise ToolError(f"Windows did not allow changing {kind} state ({status_name}).")
+    if expected and out.lower() != expected.lower():
+        raise ToolError(f"{kind} could not be turned {expected.lower()}; hardware state is {out}.")
     return out
 
 

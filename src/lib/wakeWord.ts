@@ -503,7 +503,12 @@ export class BikliWakeWordDetector {
           return;
         }
         this.consecutiveErrors++;
-        console.warn("[WakeWord] error:", err, `(#${this.consecutiveErrors})`);
+        // A permanently denied mic retries indefinitely by design (the user can
+        // grant permission at any time), so cap the logging or the console fills
+        // with thousands of identical lines.
+        if (this.consecutiveErrors <= 5 || this.consecutiveErrors % 20 === 0) {
+          console.warn("[WakeWord] error:", err, `(#${this.consecutiveErrors})`);
+        }
 
         if (err === "audio-capture") {
           // Mic busy — relaunch after a beat.
@@ -528,29 +533,36 @@ export class BikliWakeWordDetector {
             // relaunches without the prewarm, so the permission never recovers.
             this._hasPendingErrorRestart = true;
             if (this.restartTimer) clearTimeout(this.restartTimer);
+            // Back off like the network branch does. A flat 2.5s retry meant a
+            // machine with no mic, or a standing permission denial, called
+            // getUserMedia every 2.5s for the whole life of the app. Keep
+            // retrying — permission can still be granted later — but slowly.
+            const denyDelay = Math.min(
+              2500 * Math.pow(1.6, Math.min(this.consecutiveErrors - 1, 8)),
+              60000,
+            );
             this.restartTimer = setTimeout(() => {
               this._hasPendingErrorRestart = false;
               if (!this.intended || this.firing) return;
               void this.prewarmMic().finally(() => {
                 if (this.intended && !this.firing) this.launch();
               });
-            }, 2500);
+            }, denyDelay);
           }
           return;
         }
 
-        // "network" is very common in Electron (Google STT blip) — never give up.
-        // Mark a flag so onend doesn't also schedule a restart.
+        // "network" is very common in Electron (Google STT blip) — back off exponentially
+        // so we don't hammer the Chromium network pipe in a tight loop.
         this._hasPendingErrorRestart = true;
         if (this.intended && !this.firing) {
           const delay =
             err === "network"
-              ? Math.min(400 + this.consecutiveErrors * 200, 4000)
+              ? Math.min(1500 * Math.pow(1.5, Math.min(this.consecutiveErrors, 6)), 30000)
               : Math.min(500 + this.consecutiveErrors * 300, 5000);
           if (this.restartTimer) clearTimeout(this.restartTimer);
           this.restartTimer = setTimeout(() => {
             this._hasPendingErrorRestart = false;
-            this.consecutiveErrors = Math.min(this.consecutiveErrors, 3);
             if (this.intended && !this.firing) this.launch();
           }, delay);
         }
@@ -591,16 +603,18 @@ export class BikliWakeWordDetector {
         this.recognition.onerror = null;
         this.recognition.onend = null;
         this.recognition.onstart = null;
-        // Prefer stop() then abort() so the OS releases the capture device.
-        try {
-          this.recognition.stop();
-        } catch {
-          /* ignore */
-        }
+        // In Web Speech API, calling stop() followed immediately by abort() causes
+        // a race where abort() severs the Mojo pipe that stop() is trying to flush,
+        // triggering Chromium's "OnSizeReceived failed with Error: -2".
+        // Calling abort() alone cleanly and immediately halts capture without stream conflict.
         try {
           this.recognition.abort();
         } catch {
-          /* ignore */
+          try {
+            this.recognition.stop();
+          } catch {
+            /* ignore */
+          }
         }
       } catch {
         /* ignore */

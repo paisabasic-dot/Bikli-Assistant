@@ -88,6 +88,60 @@ export class BikliAudioSession {
   private lastSpeakingStartTime = 0;
   /** Timestamp of last genuine user mic energy spike above speech threshold. */
   private lastUserSpeechTime = 0;
+  /** Dynamic noise floor for adaptive speech detection and room hiss suppression. */
+  private dynamicNoiseFloor = 0.008;
+  /** True while the user is actively speaking. */
+  private isUserSpeaking = false;
+  /** True while Gemini is actively outputting speech for the current turn. */
+  private isModelTurnActive = false;
+  /** Consecutive mic frames exceeding barge-in threshold while model is speaking. */
+  private bargeInConsecutiveFrames = 0;
+  /** Safety watchdog to recover listening state if model turnComplete is delayed/dropped. */
+  private modelTurnWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True if we have already fired the turn-complete hint for this utterance. */
+  private turnHintSent = false;
+  /** Studio vocal DSP filter chain nodes for noise cancellation & EQ. */
+  private dspNodes: AudioNode[] = [];
+  /** Buffer for software Acoustic Echo Cancellation monitoring speaker output. */
+  private speakerEchoBuffer: Uint8Array | null = null;
+  /** Reused zeroed PCM frame so idle/echo is sent as digital silence, not room hiss. */
+  private silentFrame: Float32Array | null = null;
+
+  /** Consecutive above-threshold frames seen while trying to confirm speech onset. */
+  private speechOnsetFrames = 0;
+  /** Ring of recent mic frames, replayed when speech onset is confirmed so the
+   *  first consonant of a sentence is never clipped. */
+  private preRoll: Float32Array[] = [];
+  /** Wall-clock duration of one mic frame, derived from the real capture rate
+   *  (the 16kHz request at AudioContext creation can be refused by the device). */
+  private micFrameMs = 32;
+
+  // ── Voice-activity tuning ───────────────────────────────────────────────────
+  // These govern when a user turn opens and closes. Gemini's own server-side VAD
+  // (realtimeInputConfig.automaticActivityDetection in server.ts) is the primary
+  // turn-ender; everything here must stay *behind* it so the two never race.
+  /** Onset threshold, as a multiple of the tracked room-noise floor. */
+  private static SPEECH_START_MULT = 3.0;
+  /** Absolute onset floor — noise below this never opens a turn. */
+  private static SPEECH_START_FLOOR = 0.022;
+  /** Continuation threshold multiple: lower, so quiet syllables hold the turn. */
+  private static SPEECH_KEEP_MULT = 1.5;
+  /** Absolute continuation floor. */
+  private static SPEECH_KEEP_FLOOR = 0.010;
+  /** Sustained energy required before a turn opens at all. */
+  private static SPEECH_ONSET_MS = 90;
+  /** Grace window after energy drops during which real audio still streams —
+   *  covers breaths, inter-word gaps and plosive closures. */
+  private static SPEECH_HANGOVER_MS = 300;
+  /** Local backstop for ending a turn. Must exceed hangover + the server's
+   *  silenceDurationMs, so it only fires if Gemini's own signal went missing. */
+  private static TURN_END_SILENCE_MS = 1400;
+  /** Sustained loud audio required to accept a barge-in over Bikli's voice. */
+  private static BARGE_IN_MS = 96;
+  /** How much audio the pre-roll ring holds (matches Gemini's prefixPaddingMs). */
+  private static PRE_ROLL_MS = 200;
+  /** Wall-clock of the last model-audio chunk (holds listening state across packet gaps). */
+  private lastModelAudioTime = 0;
   
   // State Callbacks
   private onStateChange: (state: LiveState) => void;
@@ -103,6 +157,10 @@ export class BikliAudioSession {
     prompt?: string;
     error?: string;
   }) => void;
+  private onMissionEvent?: (event: any) => void;
+  private onTurnComplete?: () => void;
+  /** True when this session was opened for typing only — no mic was acquired. */
+  private textOnly = false;
   
   private currentState: LiveState = "disconnected";
   private isActivated = false;
@@ -176,6 +234,9 @@ export class BikliAudioSession {
       prompt?: string;
       error?: string;
     }) => void;
+    onMissionEvent?: (event: any) => void;
+    /** Fires when Gemini finishes a reply turn — lets the UI close a chat bubble. */
+    onTurnComplete?: () => void;
   }) {
     this.onStateChange = handlers.onStateChange;
     this.onTranscription = handlers.onTranscription;
@@ -184,11 +245,14 @@ export class BikliAudioSession {
     this.onMemorySync = handlers.onMemorySync;
     this.onComputerControl = handlers.onComputerControl;
     this.onImageStatus = handlers.onImageStatus;
+    this.onMissionEvent = handlers.onMissionEvent;
+    this.onTurnComplete = handlers.onTurnComplete;
   }
 
   private setState(state: LiveState) {
     if (state === "speaking" && this.currentState !== "speaking") {
       this.lastSpeakingStartTime = Date.now();
+      this.resetVadState();
     } else if (state !== "speaking") {
       this.lastSpeakingStartTime = 0;
     }
@@ -241,6 +305,92 @@ export class BikliAudioSession {
    * Push a JPEG screen frame to Gemini — only while screen vision is desired
    * and the live WebSocket is open.
    */
+  /** True when the live link is open but no microphone was acquired. */
+  public isTextOnlyMode(): boolean {
+    return this.textOnly;
+  }
+
+  /** True when the link is up and able to carry a turn. */
+  public isLive(): boolean {
+    return this.currentState === "listening" || this.currentState === "speaking";
+  }
+
+  /**
+   * Send a typed turn. Works identically whether the session was opened for
+   * voice or for text — Gemini answers with audio plus a transcription either way.
+   * Returns false if the link is not open.
+   */
+  public sendText(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    // A typed turn is a complete turn. Drop any half-open mic utterance so a
+    // trailing "umm" cannot merge into the message the user just typed.
+    this.resetVadState();
+    try {
+      this.ws.send(JSON.stringify({ text: trimmed }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Send a typed turn, opening a text-only link first if nothing is live yet.
+   * This is the path that makes typing work with the mic off.
+   */
+  public async sendTextEnsured(text: string, timeoutMs = 20000): Promise<boolean> {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+
+    // currentState can still read "listening" after the socket is gone — an
+    // abrupt server exit or a suspended machine leaves onclose unfired. Trusting
+    // it alone meant every later message failed with no way back but a restart,
+    // so check the socket itself and rebuild the link when the two disagree.
+    const socketOpen = !!this.ws && this.ws.readyState === WebSocket.OPEN;
+    if (!this.isLive() || !socketOpen) {
+      // A dead mic session should come back as a mic session, not silently
+      // downgrade the user to text-only behind their back.
+      const wantMic = this.isActivated && !this.textOnly;
+      if (this.isActivated) {
+        console.warn("[Bikli] Stale live link detected on send — rebuilding.");
+        this.teardownResources({ keepUserIntent: true });
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      try {
+        await this.connect(
+          wantMic
+            ? { micDeviceId: this.lastMicDeviceId || undefined }
+            : { textOnly: true },
+        );
+      } catch (err) {
+        if (!wantMic) {
+          console.error("[Bikli] Text-only connect failed:", err);
+          return false;
+        }
+        // Mic could not be reopened. Still get the typed message through.
+        console.warn("[Bikli] Mic reconnect failed; falling back to text-only.", err);
+        try {
+          await this.connect({ textOnly: true });
+        } catch (err2) {
+          console.error("[Bikli] Text-only fallback failed:", err2);
+          return false;
+        }
+      }
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (this.isLive()) break;
+        // connect() resolved but the link died — fail fast instead of hanging
+        // the send button for the full timeout.
+        if (!this.isActivated) return false;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!this.isLive()) return false;
+    }
+
+    return this.sendText(trimmed);
+  }
+
   public sendVideoFrame(base64Data: string) {
     if (!base64Data) return;
     if (!this.screenShareDesired) return;
@@ -279,11 +429,22 @@ export class BikliAudioSession {
 
     const constraintLadder = (prefer: boolean, step: number): MediaStreamConstraints[] => {
       const list: MediaStreamConstraints[] = [];
-      // 1) Bare boolean FIRST — most reliable across Windows drivers.
-      //    On many systems exact constraints cause immediate NotReadableError.
-      list.push({ audio: true });
-      // 2) Optional echo cancellation + noise suppression (non-exact).
-      //    Using ideal instead of exact avoids device rejection.
+      // 1) Full studio vocal constraints with WebRTC hardware echo cancellation & noise suppression
+      list.push({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 16000,
+          googEchoCancellation: true,
+          googAutoGainControl: true,
+          googNoiseSuppression: true,
+          googHighpassFilter: true,
+          googTypingNoiseDetection: true,
+        } as any,
+      });
+      // 2) Standard WebRTC echo cancellation + noise suppression (non-exact).
       list.push({
         audio: {
           echoCancellation: true,
@@ -291,14 +452,8 @@ export class BikliAudioSession {
           autoGainControl: true,
         },
       });
-      // 3) Exact echo cancellation + noise suppression (some drivers like this).
-      list.push({
-        audio: {
-          echoCancellation: { exact: true },
-          noiseSuppression: { exact: true },
-          autoGainControl: true,
-        },
-      });
+      // 3) Bare boolean (most permissive fallback across unusual Windows audio drivers)
+      list.push({ audio: true });
       if (prefer && deviceId) {
         // 4) Device with ideal constraint (non-exact, tolerant of stale IDs).
         list.push({
@@ -493,6 +648,7 @@ export class BikliAudioSession {
     if (!this.isActivated) return;
     this.clearGeminiReadyTimeout();
     this.geminiReady = true;
+    this.resetVadState();
     void this.resumeAudioContexts();
     if (this.currentState !== "speaking") {
       this.setState("listening");
@@ -506,7 +662,19 @@ export class BikliAudioSession {
     this.geminiReadyFlushTimers = [t1, t2];
   }
 
-  /** Wire mic stream into Web Audio graph (PCM → WebSocket). */
+  /** Disconnect and clear all active Studio DSP audio filter nodes. */
+  private cleanupDspNodes(): void {
+    for (const node of this.dspNodes) {
+      try {
+        node.disconnect();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.dspNodes = [];
+  }
+
+  /** Wire mic stream into Web Audio graph (PCM → WebSocket) with Studio Vocal DSP chain. */
   private setupMicGraph(stream: MediaStream) {
     if (!this.inputAudioCtx) {
       throw new Error("Input AudioContext missing.");
@@ -516,11 +684,57 @@ export class BikliAudioSession {
     this.inputAnalyser.fftSize = 256;
 
     this.micSourceNode = this.inputAudioCtx.createMediaStreamSource(this.micStream);
-    this.micSourceNode.connect(this.inputAnalyser);
+
+    // Clean up any lingering DSP nodes from prior graph
+    this.cleanupDspNodes();
+
+    // ── Professional Studio Vocal DSP Chain (0ms Latency) ──
+    // 1. High-Pass Filter: Cuts sub-bass desk rumble, AC hum, and fan motor vibrations below 80Hz
+    const highPass = this.inputAudioCtx.createBiquadFilter();
+    highPass.type = "highpass";
+    highPass.frequency.setValueAtTime(80, this.inputAudioCtx.currentTime);
+    highPass.Q.setValueAtTime(0.707, this.inputAudioCtx.currentTime);
+
+    // 2. Vocal Presence Peaking Filter: Boosts speech clarity & consonant definition in 2.8kHz band
+    const vocalPresence = this.inputAudioCtx.createBiquadFilter();
+    vocalPresence.type = "peaking";
+    vocalPresence.frequency.setValueAtTime(2800, this.inputAudioCtx.currentTime);
+    vocalPresence.Q.setValueAtTime(1.2, this.inputAudioCtx.currentTime);
+    vocalPresence.gain.setValueAtTime(2.5, this.inputAudioCtx.currentTime);
+
+    // 3. Low-Pass Anti-Aliasing & Hiss Filter: Cuts high-frequency hiss above 7.6kHz
+    const lowPass = this.inputAudioCtx.createBiquadFilter();
+    lowPass.type = "lowpass";
+    lowPass.frequency.setValueAtTime(7600, this.inputAudioCtx.currentTime);
+    lowPass.Q.setValueAtTime(0.707, this.inputAudioCtx.currentTime);
+
+    // 4. Studio Vocal Dynamics Compressor: Even dynamics, makes whisper audible and prevents clipping
+    const compressor = this.inputAudioCtx.createDynamicsCompressor();
+    compressor.threshold.setValueAtTime(-24, this.inputAudioCtx.currentTime);
+    compressor.knee.setValueAtTime(12, this.inputAudioCtx.currentTime);
+    compressor.ratio.setValueAtTime(2.5, this.inputAudioCtx.currentTime);
+    compressor.attack.setValueAtTime(0.003, this.inputAudioCtx.currentTime);
+    compressor.release.setValueAtTime(0.08, this.inputAudioCtx.currentTime);
+
+    // Connect DSP chain:
+    // micSourceNode -> highPass -> vocalPresence -> lowPass -> compressor -> micProcessorNode & inputAnalyser
+    this.micSourceNode.connect(highPass);
+    highPass.connect(vocalPresence);
+    vocalPresence.connect(lowPass);
+    lowPass.connect(compressor);
+    compressor.connect(this.inputAnalyser);
+
+    this.dspNodes = [highPass, vocalPresence, lowPass, compressor];
 
     // Silent gain sink so ScriptProcessor keeps running without speaker feedback.
-    this.micProcessorNode = this.inputAudioCtx.createScriptProcessor(2048, 1, 1);
-    this.micSourceNode.connect(this.micProcessorNode);
+    // Use 512 samples (32ms at 16kHz) for ultra-low streaming latency.
+    this.micProcessorNode = this.inputAudioCtx.createScriptProcessor(512, 1, 1);
+    // Derive real frame duration: the 16kHz request above can be refused, in which
+    // case 512 samples is ~10.7ms (48kHz) rather than 32ms, and every VAD window
+    // expressed in milliseconds would otherwise be silently wrong.
+    this.micFrameMs = (512 / (this.inputAudioCtx.sampleRate || 16000)) * 1000;
+    this.preRoll = [];
+    compressor.connect(this.micProcessorNode);
     const silentGain = this.inputAudioCtx.createGain();
     silentGain.gain.value = 0;
     this.micProcessorNode.connect(silentGain);
@@ -557,43 +771,192 @@ export class BikliAudioSession {
       }
       const rms = Math.sqrt(sum / channelData.length);
 
-      // When Bikli is speaking, speaker output feeds back into the microphone.
-      // If we send speaker bleed / ambient noise to Gemini during speaking state,
-      // Gemini's server-side VAD detects incoming audio and emits "interrupted",
-      // cutting Bikli's speech off in the middle of her response.
-      //
-      // Therefore, while Bikli is speaking:
-      // 1) Suppress mic audio for the first 600ms of her turn (startup transients).
-      // 2) Require a higher RMS threshold (> 0.048) so only intentional loud user
-      //    barge-in speech is forwarded to trigger a real interruption.
-      if (this.currentState === "speaking") {
+      let outgoingData: Float32Array = channelData;
+
+      // Software Acoustic Echo Cancellation (AEC): monitor real-time speaker playback energy
+      let speakerRms = 0;
+      if (this.outputAnalyser && this.currentState === "speaking") {
+        if (!this.speakerEchoBuffer || this.speakerEchoBuffer.length !== this.outputAnalyser.frequencyBinCount) {
+          this.speakerEchoBuffer = new Uint8Array(this.outputAnalyser.frequencyBinCount);
+        }
+        this.outputAnalyser.getByteTimeDomainData(this.speakerEchoBuffer);
+        let sSum = 0;
+        for (let i = 0; i < this.speakerEchoBuffer.length; i++) {
+          const v = (this.speakerEchoBuffer[i] - 128) / 128;
+          sSum += v * v;
+        }
+        speakerRms = Math.sqrt(sSum / this.speakerEchoBuffer.length);
+      }
+
+      // When Bikli is speaking or model turn is active, speaker output feeds back into the microphone.
+      // Software AEC & Ducking: suppress acoustic feedback so she never talks to herself or cuts off mid-speech.
+      const isBikliSpeaking = this.currentState === "speaking" || this.isModelTurnActive;
+      if (isBikliSpeaking) {
         const timeSinceSpeechStart = Date.now() - this.lastSpeakingStartTime;
-        if (timeSinceSpeechStart < 600) {
-          return; // Ignore mic during initial speech startup
+        if (timeSinceSpeechStart < 650) {
+          this.bargeInConsecutiveFrames = 0;
+          return; // Ignore mic during initial speech startup to prevent speaker echo feedback
         }
-        if (rms < 0.048) {
-          return; // Suppress speaker bleed and normal room noise while speaking
-        }
-        // User genuinely spoke loudly over Bikli to interrupt her
-        this.lastUserSpeechTime = Date.now();
-      } else {
-        // While listening: suppress pure room silence (< 0.002) to save bandwidth
-        if (rms < 0.002) {
+
+        // Dynamic echo threshold based on real-time speaker loudness
+        // Higher threshold prevents loud speaker syllables from triggering false barge-in
+        const userBargeInThreshold = Math.max(speakerRms * 2.2, 0.14);
+
+        if (rms < userBargeInThreshold) {
+          // Speaker bleed or ambient noise detected: completely duck microphone
+          this.bargeInConsecutiveFrames = 0;
           return;
         }
-        if (rms > 0.015) {
+
+        // Require several consecutive loud frames before believing this is really
+        // the user and not one loud syllable of Bikli's own voice leaking back in.
+        // A false positive here cuts her off mid-sentence.
+        this.bargeInConsecutiveFrames++;
+        if (this.bargeInConsecutiveFrames < this.framesFor(BikliAudioSession.BARGE_IN_MS, 2)) {
+          return;
+        }
+
+        // User genuinely spoke loudly over Bikli to interrupt her
+        this.lastUserSpeechTime = Date.now();
+        this.isUserSpeaking = true;
+        this.speechOnsetFrames = 0;
+        this.turnHintSent = false;
+        outgoingData = channelData;
+      } else {
+        this.bargeInConsecutiveFrames = 0;
+
+        // Hysteresis VAD. A strict threshold to OPEN a turn, a lenient one to STAY
+        // in it. With a single threshold, one quiet syllable drops you out of speech
+        // mid-sentence and one fan gust drops you into it while the room is empty.
+        const startThreshold = Math.max(
+          this.dynamicNoiseFloor * BikliAudioSession.SPEECH_START_MULT,
+          BikliAudioSession.SPEECH_START_FLOOR,
+        );
+        const keepThreshold = Math.max(
+          this.dynamicNoiseFloor * BikliAudioSession.SPEECH_KEEP_MULT,
+          BikliAudioSession.SPEECH_KEEP_FLOOR,
+        );
+        const active = this.isUserSpeaking ? rms > keepThreshold : rms > startThreshold;
+
+        if (active && !this.isUserSpeaking) {
+          // ── Candidate speech onset ──────────────────────────────────────────
+          // Demand sustained energy before opening a turn, so a keyboard click,
+          // a chair creak or a door cannot start one. Nothing is streamed yet:
+          // the frames are held in the pre-roll ring instead.
+          this.pushPreRoll(channelData);
+          this.speechOnsetFrames++;
+          if (this.speechOnsetFrames < this.framesFor(BikliAudioSession.SPEECH_ONSET_MS, 2)) {
+            return;
+          }
+
+          // Confirmed. Flush the pre-roll so the leading consonant — and Gemini's
+          // 200ms prefix-padding window — get real audio instead of a clipped word.
+          this.isUserSpeaking = true;
+          this.turnHintSent = false;
+          this.speechOnsetFrames = 0;
           this.lastUserSpeechTime = Date.now();
+          for (const frame of this.flushPreRoll()) this.sendMicFrame(frame);
+          return; // this frame was already sent as the tail of the pre-roll
+        }
+
+        if (active) {
+          // ── Sustained speech ────────────────────────────────────────────────
+          this.lastUserSpeechTime = Date.now();
+          this.turnHintSent = false;
+          outgoingData = channelData;
+        } else if (this.isUserSpeaking) {
+          // ── Low energy inside an already-open turn ──────────────────────────
+          const silenceElapsed = Date.now() - this.lastUserSpeechTime;
+
+          if (silenceElapsed <= BikliAudioSession.SPEECH_HANGOVER_MS) {
+            // A breath, a gap between words, or the closure of a plosive (p/t/k
+            // are ~50-150ms of near-silence *inside* a word). Keep streaming real
+            // audio: cutting here is what chopped sentences in half.
+            outgoingData = channelData;
+          } else {
+            // A real pause. Clamp room hiss to digital silence so Gemini's own
+            // end-of-speech detector sees a clean energy cliff and closes the turn
+            // on its own schedule (silenceDurationMs in the server setup).
+            outgoingData = this.getSilentFrame(channelData.length);
+
+            if (silenceElapsed >= BikliAudioSession.TURN_END_SILENCE_MS && !this.turnHintSent) {
+              // Backstop only. By now Gemini's server-side VAD should already have
+              // ended the turn; this fires solely for the case where that signal
+              // was dropped. It must stay well behind the server window, or it
+              // races it and ends turns while the user is still talking.
+              this.turnHintSent = true;
+              this.isUserSpeaking = false;
+              this.speechOnsetFrames = 0;
+              try {
+                this.ws.send(JSON.stringify({ type: "turn_complete_hint" }));
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+        } else {
+          // ── Idle room ───────────────────────────────────────────────────────
+          this.speechOnsetFrames = 0;
+          this.pushPreRoll(channelData);
+          this.dynamicNoiseFloor = Math.min(
+            Math.max(this.dynamicNoiseFloor * 0.96 + rms * 0.04, 0.003),
+            0.035,
+          );
+          // Send digital silence rather than raw hiss. While nobody is talking
+          // Gemini must hear *nothing*, otherwise its neural VAD eventually
+          // manufactures a turn out of fan noise and answers an empty prompt.
+          outgoingData = this.getSilentFrame(channelData.length);
         }
       }
 
-      const pcmBuffer = floatTo16BitPCM(channelData);
-      const base64 = base64ArrayBuffer(pcmBuffer);
-      try {
-        this.ws.send(JSON.stringify({ audio: base64 }));
-      } catch {
-        /* ignore transient send errors */
-      }
+      this.sendMicFrame(outgoingData);
     };
+  }
+
+  /** Number of mic frames covering `ms`, given the real capture rate. */
+  private framesFor(ms: number, min = 1): number {
+    return Math.max(min, Math.round(ms / this.micFrameMs));
+  }
+
+  /** Reused all-zero frame, so idle/ducked audio costs no allocation per frame. */
+  private getSilentFrame(length: number): Float32Array {
+    if (!this.silentFrame || this.silentFrame.length !== length) {
+      this.silentFrame = new Float32Array(length);
+    }
+    return this.silentFrame;
+  }
+
+  /** Keep the last PRE_ROLL_MS of mic audio so a confirmed onset can replay it. */
+  private pushPreRoll(frame: Float32Array): void {
+    this.preRoll.push(new Float32Array(frame));
+    const max = this.framesFor(BikliAudioSession.PRE_ROLL_MS, 3);
+    while (this.preRoll.length > max) this.preRoll.shift();
+  }
+
+  private flushPreRoll(): Float32Array[] {
+    const frames = this.preRoll;
+    this.preRoll = [];
+    return frames;
+  }
+
+  /** Clear per-utterance VAD state. Called whenever a turn ends or the mic resets. */
+  private resetVadState(): void {
+    this.isUserSpeaking = false;
+    this.turnHintSent = false;
+    this.speechOnsetFrames = 0;
+    this.bargeInConsecutiveFrames = 0;
+    this.preRoll = [];
+  }
+
+  private sendMicFrame(data: Float32Array): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const pcmBuffer = floatTo16BitPCM(data);
+    const base64 = base64ArrayBuffer(pcmBuffer);
+    try {
+      this.ws.send(JSON.stringify({ audio: base64 }));
+    } catch {
+      /* ignore transient send errors */
+    }
   }
 
   /**
@@ -606,6 +969,7 @@ export class BikliAudioSession {
 
   private async recoverMicrophone(): Promise<void> {
     if (!this.isActivated || !this.userWantsLive) return;
+    if (this.textOnly) return; // no mic was ever opened — nothing to recover
     if (this.micRecoverAttempts >= 2) {
       this.onError(
         "Microphone stopped mid-call. Click the power button to reconnect, or check mic permissions.",
@@ -634,6 +998,7 @@ export class BikliAudioSession {
         }
         this.micSourceNode = null;
       }
+      this.cleanupDspNodes();
       if (this.micStream) {
         this.micStream.getTracks().forEach((t) => {
           try {
@@ -680,10 +1045,20 @@ export class BikliAudioSession {
   }
 
   // Requests microphone and creates connections
-  public async connect(options?: { micDeviceId?: string }) {
+  public async connect(options?: { micDeviceId?: string; textOnly?: boolean }) {
     this.userWantsLive = true;
+    const wantsMic = !options?.textOnly;
+    // A live text-only session holds no microphone. If the user now presses the
+    // mic button, the "already live" fast-paths below would return success and
+    // leave them with a dead mic — so force a real reconnect instead.
+    const mustUpgrade = wantsMic && this.textOnly && this.isActivated;
+    if (mustUpgrade) {
+      console.log("[Bikli] Upgrading text-only session to live microphone…");
+      this.teardownResources({ keepUserIntent: true });
+      await new Promise((r) => setTimeout(r, 300));
+    }
     // Coalesce concurrent callers (wake + button) onto one attempt.
-    if (this.connectInFlight) {
+    if (this.connectInFlight && !mustUpgrade) {
       // Already live — nothing to do
       if (this.getState() === "listening" || this.getState() === "speaking") {
         return;
@@ -703,7 +1078,8 @@ export class BikliAudioSession {
       this.connectInFlight = null;
     }
 
-    // Already live — do nothing
+    // Already live — do nothing. (A text-only session counts as live for a
+    // text request, but mustUpgrade already tore it down for a mic request.)
     {
       const s = this.getState();
       if (s === "listening" || s === "speaking") {
@@ -722,7 +1098,8 @@ export class BikliAudioSession {
     return run;
   }
 
-  private async connectInternal(options?: { micDeviceId?: string }) {
+  private async connectInternal(options?: { micDeviceId?: string; textOnly?: boolean }) {
+    const textOnly = !!options?.textOnly;
     // Force-clean any half-open / stuck session (common after failed wake handoff).
     // Never silent-return while "connecting" — that left the mic dead forever.
     // Use quiet teardown so userWantsLive stays true for this intentional connect.
@@ -741,29 +1118,39 @@ export class BikliAudioSession {
     this.autoReconnectArmed = true;
     this.dropHandling = false;
     this.setState("connecting");
+    this.textOnly = textOnly;
     const preferredMic = options?.micDeviceId || "";
     this.lastMicDeviceId = preferredMic;
 
     try {
       // 1) Open microphone FIRST while still close to the user click / wake handoff.
       //    Doing this after async WebSocket open often fails after screen share.
-      console.log("[Bikli] Opening microphone…");
-      const stream = await this.openMicrophone(preferredMic || undefined);
-      if (!this.isActivated || gen !== this.connectGen) {
-        stream.getTracks().forEach((t) => {
-          try {
-            t.stop();
-          } catch {
-            /* ignore */
-          }
-        });
-        return;
+      //    Text-only sessions skip this entirely: typing must work with no mic
+      //    permission, no mic hardware, and the wake detector still holding the
+      //    device. Everything downstream — tools, memory, vision, spoken replies —
+      //    is driven by the WebSocket, not by the capture graph.
+      let stream: MediaStream | null = null;
+      if (textOnly) {
+        console.log("[Bikli] Text-only session — skipping microphone.");
+      } else {
+        console.log("[Bikli] Opening microphone…");
+        stream = await this.openMicrophone(preferredMic || undefined);
+        if (!this.isActivated || gen !== this.connectGen) {
+          stream.getTracks().forEach((t) => {
+            try {
+              t.stop();
+            } catch {
+              /* ignore */
+            }
+          });
+          return;
+        }
       }
 
       // 2) Audio contexts (must be after a user gesture when possible)
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioContextClass) {
-        stream.getTracks().forEach((t) => {
+        stream?.getTracks().forEach((t) => {
           try {
             t.stop();
           } catch {
@@ -774,10 +1161,13 @@ export class BikliAudioSession {
       }
 
       // Prefer exact rates; fall back if the device rejects the sampleRate option.
-      try {
-        this.inputAudioCtx = new AudioContextClass({ sampleRate: 16000 });
-      } catch {
-        this.inputAudioCtx = new AudioContextClass();
+      // No capture context in text-only mode — nothing would feed it.
+      if (stream) {
+        try {
+          this.inputAudioCtx = new AudioContextClass({ sampleRate: 16000 });
+        } catch {
+          this.inputAudioCtx = new AudioContextClass();
+        }
       }
       try {
         this.outputAudioCtx = new AudioContextClass({ sampleRate: 24000 });
@@ -793,7 +1183,7 @@ export class BikliAudioSession {
       this.outputGainNode.connect(this.outputAnalyser);
       this.outputAnalyser.connect(this.outputAudioCtx.destination);
 
-      this.setupMicGraph(stream);
+      if (stream) this.setupMicGraph(stream);
       this.startAudioKeepAlive();
 
       // A newer connect() already owns `this.*` — tearing down here would kill
@@ -895,8 +1285,18 @@ export class BikliAudioSession {
             return;
           }
 
+          if (data.type === "mission_event") {
+            this.onMissionEvent?.(data.event);
+            return;
+          }
+
           // Handle audio payload (24kHzPCM model response)
           if (data.type === "audio" && data.audio) {
+            this.isModelTurnActive = true;
+            if (this.modelTurnWatchdogTimer) {
+              clearTimeout(this.modelTurnWatchdogTimer);
+              this.modelTurnWatchdogTimer = null;
+            }
             // First audio can arrive slightly before status=connected on some paths
             if (!this.geminiReady) this.markGeminiReady();
             this.playAudioPCMChunk(data.audio);
@@ -909,18 +1309,29 @@ export class BikliAudioSession {
 
           // Turn complete
           if (data.type === "turnComplete") {
+            this.isModelTurnActive = false;
+            this.resetVadState();
+            this.onTurnComplete?.();
+            if (this.modelTurnWatchdogTimer) {
+              clearTimeout(this.modelTurnWatchdogTimer);
+              this.modelTurnWatchdogTimer = null;
+            }
             // Once Bikli completes speaking, change visual state back to listening
             if (this.turnCompleteTimer) clearTimeout(this.turnCompleteTimer);
-            this.turnCompleteTimer = setTimeout(() => {
-              this.turnCompleteTimer = null;
-              if (
-                gen === this.connectGen &&
-                this.activeSources.length === 0 &&
-                this.currentState === "speaking"
-              ) {
-                this.setState("listening");
-              }
-            }, 100);
+            if (this.activeSources.length === 0 && this.currentState === "speaking") {
+              this.setState("listening");
+            } else {
+              this.turnCompleteTimer = setTimeout(() => {
+                this.turnCompleteTimer = null;
+                if (
+                  gen === this.connectGen &&
+                  this.activeSources.length === 0 &&
+                  this.currentState === "speaking"
+                ) {
+                  this.setState("listening");
+                }
+              }, 40);
+            }
           }
 
           // Handle live captions transcription
@@ -1034,18 +1445,32 @@ export class BikliAudioSession {
 
   // Interruption triggers: stops all active audio players immediately
   private handleInterruption() {
-    // Only accept interruption if Bikli has been speaking for > 500ms
-    // AND either the user recently spoke loudly (RMS threshold met) or speech started > 1s ago.
-    // This prevents Gemini's false-positive server interruptions from cutting off Bikli's voice.
+    if (this.currentState !== "speaking" && !this.isModelTurnActive) return;
     const timeSpeaking = Date.now() - this.lastSpeakingStartTime;
-    const timeSinceUserSpeech = Date.now() - this.lastUserSpeechTime;
 
-    if (timeSpeaking < 500 && timeSinceUserSpeech > 1200) {
-      console.warn("[Audio] Suppressed false server interruption (Bikli just started speaking).");
+    // Suppress false-positive server interruptions during the first 650ms of speech.
+    // Speaker bleed on laptops frequently causes Gemini to emit "interrupted" right as
+    // speech begins. Only genuine user barge-in after 650ms should halt audio.
+    if (timeSpeaking < 650) {
+      console.warn(`[Audio] Suppressed false server interruption (Bikli just started speaking: ${timeSpeaking}ms).`);
       return;
     }
 
-    console.log("[Audio] Interruption signal received; flushing play logs.");
+    // Crucial check: If the user is NOT actively speaking according to local mic analysis,
+    // this server interruption is an echo false-positive from Gemini VAD.
+    // Suppress it and let the queued speech continue playing without cutting off.
+    if (!this.isUserSpeaking) {
+      console.warn(`[Audio] Suppressed false server interruption (no local user speech detected, isUserSpeaking=false).`);
+      return;
+    }
+
+    console.log("[Audio] Genuine user interruption confirmed; flushing play queue.");
+    this.isModelTurnActive = false;
+    this.bargeInConsecutiveFrames = 0;
+    if (this.modelTurnWatchdogTimer) {
+      clearTimeout(this.modelTurnWatchdogTimer);
+      this.modelTurnWatchdogTimer = null;
+    }
     
     // Stop all playing nodes
     this.activeSources.forEach((source) => {
@@ -1065,12 +1490,6 @@ export class BikliAudioSession {
   // Direct raw PCM chunk scheduled playback at 24kHz
   private playAudioPCMChunk(base64Audio: string) {
     if (!this.outputAudioCtx || !this.outputGainNode) return;
-
-    // Transport-duplicate guard: if the exact same chunk comes twice in a row,
-    // play it once. (Real audio frames are never byte-identical back-to-back, so
-    // this only ever drops genuine re-sends, not legitimately repeated speech.)
-    if (base64Audio === this.lastAudioChunk) return;
-    this.lastAudioChunk = base64Audio;
 
     const schedule = () => {
       if (!this.outputAudioCtx || !this.outputGainNode || !this.isActivated) return;
@@ -1092,15 +1511,17 @@ export class BikliAudioSession {
 
         const currentTime = this.outputAudioCtx.currentTime;
 
-        // Gapless scheduler sync
+        // Gapless scheduler sync with 30ms safety cushion to absorb packet jitter
         if (this.nextStartTime < currentTime) {
-          // Start fresh: 30ms ahead to bridge schedule timing
-          this.nextStartTime = currentTime + 0.03;
+          this.nextStartTime = currentTime + 0.030;
         }
+
+        const playbackRate = 1.0; // 1.0 matches Gemini Live 24kHz generation rate exactly, preventing queue starvation
+        source.playbackRate.setValueAtTime(playbackRate, this.outputAudioCtx.currentTime);
 
         source.start(this.nextStartTime);
         this.setState("speaking");
-        this.nextStartTime += buffer.duration;
+        this.nextStartTime += buffer.duration / playbackRate;
         success = true;
 
         // Keep reference to handle real-time interruptions
@@ -1110,9 +1531,23 @@ export class BikliAudioSession {
             this.activeSources.splice(index, 1);
           }
 
-          // If there are no more active play nodes, revert state back to listening
-          if (this.activeSources.length === 0 && this.currentState === "speaking") {
-            this.setState("listening");
+          // Only switch back to listening if model turn is complete AND all active sources ended.
+          // If model turn is still active, more chunks are in flight: do NOT revert state to listening,
+          // which would un-duck the mic and allow speaker reverberation to cut off Bikli!
+          if (this.activeSources.length === 0) {
+            if (!this.isModelTurnActive && this.currentState === "speaking") {
+              this.setState("listening");
+            } else if (this.isModelTurnActive) {
+              // Start watchdog in case network drops turnComplete packet
+              if (this.modelTurnWatchdogTimer) clearTimeout(this.modelTurnWatchdogTimer);
+              this.modelTurnWatchdogTimer = setTimeout(() => {
+                this.modelTurnWatchdogTimer = null;
+                if (this.activeSources.length === 0 && this.currentState === "speaking") {
+                  this.isModelTurnActive = false;
+                  this.setState("listening");
+                }
+              }, 1500);
+            }
           }
         };
 
@@ -1226,6 +1661,9 @@ export class BikliAudioSession {
     this.connectGen++;
     this.isActivated = false;
     this.geminiReady = false;
+    this.isModelTurnActive = false;
+    this.textOnly = false;
+    this.resetVadState();
 
     if (!opts?.keepUserIntent) {
       this.userWantsLive = false;
@@ -1249,6 +1687,10 @@ export class BikliAudioSession {
     if (this.turnCompleteTimer) {
       clearTimeout(this.turnCompleteTimer);
       this.turnCompleteTimer = null;
+    }
+    if (this.modelTurnWatchdogTimer) {
+      clearTimeout(this.modelTurnWatchdogTimer);
+      this.modelTurnWatchdogTimer = null;
     }
     if (this.keepAliveOsc) {
       this.keepAliveOsc.stop();
@@ -1301,6 +1743,8 @@ export class BikliAudioSession {
       } catch (e) {}
       this.micSourceNode = null;
     }
+
+    this.cleanupDspNodes();
 
     // Close Audio contexts
     if (this.inputAudioCtx) {

@@ -102,6 +102,9 @@ DESKTOP_TOOL_NAMES = [
     "searchGoogle",
     "searchGitHub",
     "openImage",
+    "browserOpenUrl",
+    "browserSearch",
+    "browserPlayYouTube",
     # Windows system settings (Bluetooth, Wi‑Fi, theme, settings pages)
     "systemSetting",
     "openWindowsSetting",
@@ -199,12 +202,24 @@ DESKTOP_TOOL_NAMES = [
     "pressKey",
     "hotkey",
     "mouseMoveAndClick",
+    # Autonomous Vision & Web Agent (Browser-Use & Claude Computer Use)
+    "startAutonomousMission",
+    "stopAutonomousMission",
+    "pauseAutonomousMission",
+    "resumeAutonomousMission",
+    "getAutonomousMissionStatus",
 ]
 
 # Tools that work even when computer control is LOCKED.
 # Everything else in DESKTOP_TOOL_NAMES requires the control word first.
 CONTROL_ALWAYS_ALLOWED = frozenset(
     {
+        # Autonomous Mission Controls
+        "startAutonomousMission",
+        "stopAutonomousMission",
+        "pauseAutonomousMission",
+        "resumeAutonomousMission",
+        "getAutonomousMissionStatus",
         "enableComputerControl",
         "disableComputerControl",
         "getComputerControlStatus",
@@ -220,11 +235,9 @@ CONTROL_ALWAYS_ALLOWED = frozenset(
         "readScreen",
         "getClipboard",
         "getAutoStartStatus",
-        # Real-browser media (YouTube in Chrome) — no control word.
-        # NOTE: browserScroll is intentionally NOT here — its implementation
-        # moves the physical cursor and scrolls whatever window is under it,
-        # so it requires the control word like other cursor tools.
+        # Real-browser media & web (YouTube in Chrome) — no control word.
         "browserMediaControl",
+        "browserScroll",
         "openWebsite",
         "searchYouTube",
         "playYouTube",
@@ -232,6 +245,9 @@ CONTROL_ALWAYS_ALLOWED = frozenset(
         "searchWeb",
         "searchGitHub",
         "openImage",
+        "browserOpenUrl",
+        "browserSearch",
+        "browserPlayYouTube",
         # Image Generation & Camera
         "generateImage",
         "openCamera",
@@ -287,6 +303,8 @@ _MODULE_NAMES = [
     "tools_startup",
     "tools_cursor",
     "tools_image",
+    "tools_autonomous",
+    "tools_agent_browser",
 ]
 
 

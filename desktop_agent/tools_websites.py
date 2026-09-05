@@ -387,14 +387,16 @@ def open_url(url: str, *, new_window: bool = False, new_tab: bool = False) -> st
         _open_url_via_os(url, new=0)
         return url
 
-    # ALWAYS hand the OS the exact URL. Clipboard Ctrl+L → Ctrl+V races
-    # frequently paste the wrong/old link ("error links" user report).
-    # Same-tab keyboard navigate is intentionally disabled for reliability.
+    # Enforce same-tab navigation via agent-browser by default
+    try:
+        from .tools_agent_browser import browser_open_url
+        browser_open_url(url, new_tab=False)
+        return url
+    except Exception:
+        pass
+
+    # Fallback to OS open if agent-browser is not available
     _open_url_via_os(url, new=0)
-    # Bring the browser to the foreground: opening into an already-running
-    # browser adds a tab WITHOUT focusing the window, so "open YouTube" used to
-    # leave the window hidden ("window not found"). Retry a few times in case
-    # the browser was just launched and its window is still appearing.
     if platform.system() == "Windows":
         for _ in range(3):
             if _focus_browser_for_url(url):

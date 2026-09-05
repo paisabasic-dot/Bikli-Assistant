@@ -2,11 +2,9 @@ import { useState, useEffect, useRef } from "react";
 import { BikliAudioSession, LiveState } from "./lib/audio";
 import { BikliCoreVisualizer, BikliEmotion } from "./components/BikliCoreVisualizer";
 import { LiveWaveform } from "./components/LiveWaveform";
-import { BrowserAgent } from "./components/BrowserAgent";
 import {
   Power,
   Volume2,
-  Globe,
   Compass,
   CircleAlert,
   Mic,
@@ -18,13 +16,16 @@ import {
   Pause,
   Square,
   RefreshCw,
-  Settings as SettingsIcon
+  Settings as SettingsIcon,
+  Bot,
+  Send
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { Memory, MemoryCategory } from "./lib/memoryTypes";
 import { MemoryDashboard } from "./components/MemoryDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { CameraModal } from "./components/CameraModal";
+import { AutonomousMissionHUD, MissionEvent } from "./components/AutonomousMissionHUD";
 import { BikliSettings, loadSettings, saveSettings } from "./lib/settingsStore";
 import { BikliWakeWordDetector, WakeWordState } from "./lib/wakeWord";
 
@@ -66,6 +67,10 @@ export default function App() {
   const [imageRequestNonce, setImageRequestNonce] = useState<number>(0);
   const [imageError, setImageError] = useState<string | null>(null);
 
+  // Autonomous Vision & Web Agent Mission HUD states
+  const [isMissionHudOpen, setIsMissionHudOpen] = useState<boolean>(false);
+  const [latestMissionEvent, setLatestMissionEvent] = useState<MissionEvent | null>(null);
+
   // References to preserve state across intervals
   const screenStreamRef = useRef<MediaStream | null>(null);
   const screenVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -87,6 +92,24 @@ export default function App() {
   useEffect(() => {
     isCameraVisionRef.current = isCameraVisionActive;
   }, [isCameraVisionActive]);
+
+  // Emergency stop keyboard shortcut: Escape stops running autonomous mission & closes HUD
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (isMissionHudOpen || latestMissionEvent?.status === "RUNNING") {
+          fetch("/api/mission/stop", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reason: "Emergency stop triggered by Escape key" }),
+          }).catch(() => {});
+          setIsMissionHudOpen(false);
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isMissionHudOpen, latestMissionEvent]);
   // Re-entrancy guard for startScreenSharing: two concurrent invocations would
   // both tear down, then each acquire a display stream, and the later one would
   // overwrite screenStreamRef, leaking the earlier stream (never stopped).
@@ -823,6 +846,15 @@ export default function App() {
   // Nothing is painted on screen — fully caption-free UI.
   const userTranscriptRef = useRef<string>("");
   const modelTranscriptRef = useRef<string>("");
+
+  // ── Text chat ─────────────────────────────────────────────────────────────
+  // Input only. Nothing is transcribed to screen: the UI stays caption-free and
+  // Bikli answers a typed message out loud, exactly as she answers a spoken one.
+  const [chatInput, setChatInput] = useState("");
+  const [chatSending, setChatSending] = useState(false);
+  /** The typing box is hidden until the Chat button in the 3D control pill is pressed. */
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
   const [characterState, setCharacterState] = useState<"idle" | "thinking" | "talking">("idle");
 
   const detectEmotionFromText = (text: string): BikliEmotion => {
@@ -839,50 +871,8 @@ export default function App() {
     if (lower.includes("what?") || lower.includes("confus") || lower.includes("puzzled") || lower.includes("dont know") || lower.includes("not sure") || lower.includes("wait")) return "confused";
     return "idle";
   };
-  // In-built browser engine: runs in background by default (no full-screen UI).
-  const [browserEngineOn, setBrowserEngineOn] = useState<boolean>(false);
-  const [browserUiVisible, setBrowserUiVisible] = useState<boolean>(false);
-  const [browserSeedUrl, setBrowserSeedUrl] = useState<string>("about:blank");
   const [showGuide, setShowGuide] = useState<boolean>(false);
   const [errorText, setErrorText] = useState<string | null>(null);
-
-  // Bikli Autopilot system controller state
-  const [browserTrigger, setBrowserTrigger] = useState<{
-    type: string;
-    args: any;
-    id: string;
-    callback: (res: any) => void;
-  } | null>(null);
-
-  /** Resolve website shortcuts / free text into a URL for the in-built browser. */
-  const resolveInbuiltUrl = (raw: string | undefined | null): string => {
-    const s = (raw || "").trim();
-    if (!s) return "https://html.duckduckgo.com/html/";
-    const key = s.toLowerCase().replace(/^https?:\/\//, "").replace(/\/$/, "");
-    const shortcuts: Record<string, string> = {
-      youtube: "https://www.youtube.com",
-      yt: "https://www.youtube.com",
-      google: "https://html.duckduckgo.com/html/",
-      github: "https://github.com",
-      gmail: "https://mail.google.com",
-      chatgpt: "https://chatgpt.com",
-      duckduckgo: "https://html.duckduckgo.com/html/",
-      ddg: "https://html.duckduckgo.com/html/",
-    };
-    if (shortcuts[key] || shortcuts[s.toLowerCase()]) {
-      return shortcuts[key] || shortcuts[s.toLowerCase()];
-    }
-    if (/^https?:\/\//i.test(s)) return s;
-    if (/^[\w.-]+\.[a-z]{2,}/i.test(s)) return `https://${s}`;
-    return `https://html.duckduckgo.com/html/?q=${encodeURIComponent(s)}`;
-  };
-
-  /** Start / keep the hidden in-built browser engine (never pops the full UI). */
-  const ensureBackgroundBrowser = (seedUrl?: string) => {
-    if (seedUrl) setBrowserSeedUrl(resolveInbuiltUrl(seedUrl));
-    setBrowserEngineOn(true);
-    // Intentionally do NOT set browserUiVisible — stay in background
-  };
 
   // Bikli recollections database core state
   const [memories, setMemories] = useState<Memory[]>([]);
@@ -1409,6 +1399,17 @@ export default function App() {
           setImageError(data.error || "Image generation failed.");
         }
       },
+      onMissionEvent: (event) => {
+        setLatestMissionEvent(event);
+        if (
+          event.type === "mission_started" ||
+          event.type === "step_update" ||
+          event.type === "confirmation_needed" ||
+          event.type === "open_mission_hud"
+        ) {
+          setIsMissionHudOpen(true);
+        }
+      },
       onTranscription: (role, text) => {
         if (role === "user") {
           const prev = userTranscriptRef.current;
@@ -1477,7 +1478,6 @@ export default function App() {
             }).catch(() => {});
           }
         } else if (role === "model") {
-          // Emotion only — never show model text on screen
           modelTranscriptRef.current = (modelTranscriptRef.current + text).slice(-600);
           setActiveEmotion(detectEmotionFromText(modelTranscriptRef.current));
           userTranscriptRef.current = "";
@@ -1485,41 +1485,8 @@ export default function App() {
       },
       onToolCall: (name, args, callback) => {
         console.log(`[App] Tool call triggered: ${name}`, args);
-        
-        // openWebsite / search* / browserMediaControl / browserScroll / browserType
-        // are handled by the server/desktop agent (real Chrome/Edge).
-        // Only pure in-app browser automation stays on the client iframe.
-        const clientBrowserTools = [
-          "browserOpen",
-          "browserSearch",
-          "browserClick",
-          "browserGoBack",
-          "browserTabAction",
-        ];
 
-        if (clientBrowserTools.includes(name)) {
-          let triggerType = name;
-          let triggerArgs: any = args || {};
-
-          if (name === "browserOpen") {
-            const url = resolveInbuiltUrl(args?.url || "youtube.com");
-            triggerArgs = { ...args, url };
-            ensureBackgroundBrowser(url);
-          } else {
-            // Other browser actions still need the engine alive
-            ensureBackgroundBrowser();
-          }
-
-          setBrowserTrigger({
-            type: triggerType,
-            args: triggerArgs,
-            id: Math.random().toString(),
-            callback: (res) => {
-              callback(res);
-              setBrowserTrigger(null);
-            },
-          });
-        } else if (name === "openCamera") {
+        if (name === "openCamera") {
           startCameraVision()
             .then(() => callback({ result: "Camera App opened. Bikli live vision active on camera feed." }))
             .catch((err) => callback({ error: `Could not open camera: ${err.message || err}` }));
@@ -1707,6 +1674,45 @@ export default function App() {
     return false;
   };
 
+  // Opening the box should put the caret in it — otherwise every message costs
+  // an extra click.
+  useEffect(() => {
+    if (isChatOpen) chatInputRef.current?.focus();
+  }, [isChatOpen]);
+
+  /**
+   * Send a typed message. Opens a text-only link on demand, so this works with
+   * the mic off, with no mic permission, and with no microphone attached. When
+   * the mic *is* live it reuses that same session, so voice and typing share
+   * one conversation rather than competing for it.
+   */
+  const handleSendChat = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    const text = chatInput.trim();
+    if (!text || chatSending) return;
+
+    const session = sessionRef.current;
+    if (!session) return;
+
+    setChatInput("");
+    setChatSending(true);
+    setErrorText(null);
+
+    try {
+      const ok = await session.sendTextEnsured(text);
+      if (!ok) {
+        setErrorText(
+          "Could not send that message — the live link would not open. Check your API key in Settings and that BIKLI's server is running.",
+        );
+      }
+    } catch (err) {
+      console.error("[Chat] send failed:", err);
+      setErrorText("Could not send that message. Try again.");
+    } finally {
+      setChatSending(false);
+    }
+  };
+
   /**
    * Power / mic button. Must release wake-word mic BEFORE live getUserMedia,
    * especially after Share Screen (media stack is often busy).
@@ -1719,15 +1725,24 @@ export default function App() {
 
     const current = session.getState();
 
-    // Already live → sleep / turn mic off
-    if (current === "listening" || current === "speaking") {
+    // Live *with a mic* → sleep / turn mic off.
+    // Live text-only → the user is asking for the microphone, not for a hang-up,
+    // so fall through to the connect path (which upgrades the session in place).
+    if (
+      (current === "listening" || current === "speaking") &&
+      !session.isTextOnlyMode()
+    ) {
       session.disconnect();
       lastManualDisconnectRef.current = Date.now();
       return;
     }
 
-    // Stuck connecting / half-open → hard reset then retry
-    if (current === "connecting" || current !== "disconnected") {
+    // Stuck connecting / half-open → hard reset then retry.
+    // connect() tears down a live text-only session itself (mustUpgrade), so
+    // doing it here as well would just add a needless extra reconnect.
+    const upgradingFromText =
+      (current === "listening" || current === "speaking") && session.isTextOnlyMode();
+    if (!upgradingFromText && (current === "connecting" || current !== "disconnected")) {
       console.warn("[Mic] Resetting session before button connect…");
       session.disconnect();
       await new Promise((r) => setTimeout(r, 300));
@@ -1922,7 +1937,7 @@ export default function App() {
   };
   const suggestionCards = [
     { text: "Bikli, change atmosphere of your core to crimson", desc: "Shifts theme color background" },
-    { text: "Open youtube.com", desc: "Opens in-built browser in background (hidden)" },
+    { text: "Open YouTube and play Believer", desc: "Plays music in your real browser" },
     { text: "Tell me a witty joke and change background to gold", desc: "Combines tools & voice" },
     { text: "Mic off", desc: "Turns off Bikli's mic and ends the live session" },
   ];
@@ -1969,13 +1984,15 @@ export default function App() {
       />
 
       {/* FULL VIEWPORT HOLOGRAPHIC STAGE: Bikli materializes across the entire screen */}
-      <div className="absolute inset-0 z-0 pointer-events-none select-none">
+      <div className="absolute inset-0 z-0 select-none pointer-events-auto">
         <BikliCoreVisualizer
           session={sessionRef.current}
           state={state}
           themeColor={themeColor}
           activeEmotion={activeEmotion}
           characterState={characterState}
+          isChatOpen={isChatOpen}
+          onToggleChat={() => setIsChatOpen((v) => !v)}
         />
       </div>
 
@@ -2090,8 +2107,9 @@ export default function App() {
 
       {/* HEADER SECTION - Minimalist typography */}
       <header className="relative z-30 flex items-center justify-between w-full max-w-5xl mx-auto select-none">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold tracking-[0.4em] text-white/50 uppercase font-sans">
+        <div className="flex items-center gap-2.5">
+          <img src="/icon-192x192.png" alt="Bikli Logo" className="w-5 h-5 rounded-md shadow-sm opacity-85 object-contain" />
+          <span className="text-sm font-semibold tracking-[0.4em] text-white/70 uppercase font-sans">
             Bikli
           </span>
           <div className={`w-1.5 h-1.5 rounded-full ${
@@ -2147,6 +2165,20 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-5">
+          {/* Autonomous Vision & Web Agent Mission HUD button */}
+          <button
+            onClick={() => setIsMissionHudOpen(!isMissionHudOpen)}
+            className={`flex items-center gap-1.5 transition text-xs font-mono tracking-widest cursor-pointer ${
+              isMissionHudOpen || latestMissionEvent?.status === "RUNNING"
+                ? "text-cyan-400 opacity-100 font-semibold"
+                : "opacity-35 hover:opacity-100 text-white"
+            }`}
+            title="Autonomous Vision & Web Mission HUD"
+          >
+            <Bot size={14} className={latestMissionEvent?.status === "RUNNING" ? "animate-pulse text-cyan-400" : ""} />
+            <span className="hidden sm:inline">MISSION</span>
+          </button>
+
           <button
             onClick={() => setShowMemoryDashboard(!showMemoryDashboard)}
             className="flex items-center gap-1 opacity-25 hover:opacity-100 text-white transition text-xs font-mono tracking-widest cursor-pointer"
@@ -2201,42 +2233,7 @@ export default function App() {
       </header>
 
       {/* CORE AVATAR AND VISUALS */}
-      <main className="relative z-10 flex-1 w-full max-w-4xl mx-auto flex flex-col items-center justify-between py-6">
-
-        {/* Tiny background-browser indicator (no full panel — engine stays hidden) */}
-        <AnimatePresence>
-          {browserEngineOn && !browserUiVisible && (
-            <div className="absolute inset-x-0 top-0 z-30 flex justify-center p-2 pointer-events-none">
-              <motion.div
-                initial={{ opacity: 0, y: -12 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -12 }}
-                className="pointer-events-auto flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-slate-950/50 backdrop-blur-md text-[10px] font-mono text-slate-400"
-              >
-                <Globe size={12} className="text-indigo-400" />
-                <span className="tracking-widest uppercase">Browser running in background</span>
-                <button
-                  onClick={() => setBrowserUiVisible(true)}
-                  className="ml-1 px-2 py-0.5 rounded-full bg-white/5 hover:bg-white/10 text-slate-300 cursor-pointer"
-                  title="Show in-built browser"
-                >
-                  Show
-                </button>
-                <button
-                  onClick={() => {
-                    setBrowserEngineOn(false);
-                    setBrowserUiVisible(false);
-                    setBrowserTrigger(null);
-                  }}
-                  className="p-0.5 rounded hover:bg-white/10 text-slate-500 hover:text-white cursor-pointer"
-                  title="Stop background browser"
-                >
-                  <X size={11} />
-                </button>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
+      <main className="relative z-10 flex-1 w-full max-w-4xl mx-auto flex flex-col items-center justify-between py-6 pointer-events-none">
 
         {/* Space Spacer to avoid head area — fully caption-free stage */}
         <div className="h-10 sm:h-20" />
@@ -2248,7 +2245,7 @@ export default function App() {
               initial={{ opacity: 0, x: -24, y: 0 }}
               animate={{ opacity: 1, x: 0, y: 0 }}
               exit={{ opacity: 0, x: -24, y: 0 }}
-              className="absolute left-6 top-24 z-40 p-5 rounded-2xl border border-white/10 bg-slate-900/85 backdrop-blur-2xl max-w-md text-left shadow-2xl"
+              className="absolute left-6 top-24 z-40 p-5 rounded-2xl border border-white/10 bg-slate-900/85 backdrop-blur-2xl max-w-md text-left shadow-2xl pointer-events-auto"
             >
               <div className="flex items-center justify-between mb-3 text-white">
                 <div className="flex items-center gap-1.5 font-display text-sm font-bold tracking-wide">
@@ -2263,7 +2260,7 @@ export default function App() {
                 </button>
               </div>
               <p className="text-xs text-slate-400 mb-4 font-mono leading-relaxed">
-                Bikli is equipped with dynamic visual modules and standard text browser projectors. Here are clever triggers to try speaking aloud:
+                Bikli is equipped with voice intelligence, real browser control, and desktop automation. Here are clever triggers to try speaking aloud:
               </p>
               <div className="space-y-2 text-xs font-serif italic text-indigo-300">
                 {suggestionCards.map((c) => (
@@ -2296,7 +2293,7 @@ export default function App() {
               initial={{ opacity: 0, x: 30, y: 0 }}
               animate={{ opacity: 1, x: 0, y: 0 }}
               exit={{ opacity: 0, x: 30, y: 0 }}
-              className="absolute right-6 top-24 z-40 flex items-start gap-3 p-4 rounded-2xl border border-rose-500/20 bg-slate-950/80 backdrop-blur-xl shadow-2xl max-w-[420px] w-auto text-left"
+              className="absolute right-6 top-24 z-40 flex items-start gap-3 p-4 rounded-2xl border border-rose-500/20 bg-slate-950/80 backdrop-blur-xl shadow-2xl max-w-[420px] w-auto text-left pointer-events-auto"
             >
               <CircleAlert className="text-rose-400 shrink-0 mt-0.5" size={18} />
               <div>
@@ -2320,6 +2317,42 @@ export default function App() {
 
         {/* Dynamic Minimalist Waveform Visualizer (self-contained, no App re-render) */}
         <LiveWaveform state={state} />
+
+        {/* ── TEXT CHAT ──────────────────────────────────────────────────────
+            Hidden until the Chat button in the 3D control pill is pressed.
+            Input only — nothing is printed to screen: Bikli answers a typed
+            message out loud, the same way she answers a spoken one. Sending
+            with the mic off opens a text-only link; with the mic on it reuses
+            the live session. */}
+        {isChatOpen && (
+          <form
+            onSubmit={handleSendChat}
+            className="flex w-full max-w-md items-center gap-2 px-4"
+          >
+            <input
+              ref={chatInputRef}
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder={
+                state === "disconnected" ? "Type a message — no mic needed…" : "Type a message…"
+              }
+              aria-label="Message Bikli"
+              className="min-w-0 flex-1 rounded-full border border-white/10 bg-white/[0.04] px-3.5 py-1.5 text-[12px] text-slate-200 outline-none transition-colors placeholder:text-white/25 focus:border-cyan-400/40 focus:bg-white/[0.07]"
+            />
+            <button
+              type="submit"
+              disabled={!chatInput.trim() || chatSending}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-cyan-400/30 bg-cyan-500/15 text-cyan-100 transition-all hover:bg-cyan-500/25 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-white/25 enabled:cursor-pointer"
+              title="Send message"
+            >
+              {chatSending ? (
+                <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-cyan-200 border-t-transparent" />
+              ) : (
+                <Send size={14} />
+              )}
+            </button>
+          </form>
+        )}
 
         {/* Glossy Beautiful Primary Connector Core Node */}
         <div className="flex items-center justify-center relative mb-4">
@@ -2358,16 +2391,13 @@ export default function App() {
           </button>
 
           {/* Quiet Reset Projection Anchor */}
-          {(browserEngineOn || errorText) && (
+          {errorText && (
             <button 
               onClick={() => {
-                setBrowserEngineOn(false);
-                setBrowserUiVisible(false);
-                setBrowserTrigger(null);
                 setErrorText(null);
               }}
               className="absolute right-[-60px] p-2 rounded-full hover:bg-white/5 text-slate-400 hover:text-white transition duration-150 cursor-pointer"
-              title="Stop browser / clear errors"
+              title="Clear errors"
             >
               <X size={16} />
             </button>
@@ -2375,19 +2405,6 @@ export default function App() {
         </div>
 
       </footer>
-
-      {/* In-built browser engine — always background unless user clicks Show */}
-      {browserEngineOn && (
-        <BrowserAgent
-          url={browserSeedUrl}
-          visible={browserUiVisible}
-          onClose={() => {
-            // Hide UI only — keep engine running for continued voice automation
-            setBrowserUiVisible(false);
-          }}
-          actionTrigger={browserTrigger}
-        />
-      )}
 
       {/* Dynamic Floating Glassmorphic Screen Sharing Control Hub */}
       <AnimatePresence>
@@ -2577,6 +2594,13 @@ export default function App() {
         videoRef={cameraVideoRef}
         isVisionActive={isCameraVisionActive}
         onToggleVision={() => setIsCameraVisionActive(!isCameraVisionActive)}
+      />
+
+      {/* Autonomous Vision & Web Mission HUD Modal */}
+      <AutonomousMissionHUD
+        isOpen={isMissionHudOpen}
+        onClose={() => setIsMissionHudOpen(false)}
+        latestEvent={latestMissionEvent}
       />
     </div>
   );

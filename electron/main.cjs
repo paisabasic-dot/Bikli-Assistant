@@ -28,19 +28,42 @@ const {
 } = require('electron');
 const path = require('path');
 const http = require('http');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 
 // Help media capture + wake-word speech work reliably in packaged builds.
 try {
-  app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
+  // WebRTC Audio Processing Module (AEC3 acoustic echo cancellation, noise suppression, AGC)
+  app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer,WebRtcApmDownmixCaptureAudioMethod');
+  app.commandLine.appendSwitch('enable-webrtc-apm-in-audio-service');
   // Allow AudioContext / speech after wake word without an extra click.
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-  // Reduce Chromium media-device flakiness on Windows after SpeechRecognition.
-  app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling');
+  // Reduce Chromium media-device flakiness on Windows and disable Media Foundation on Windows N (missing mf.dll).
+  app.commandLine.appendSwitch(
+    'disable-features',
+    'HardwareMediaKeyHandling,MediaFoundationVideoCapture,MediaFoundationVideoPlayback,MediaFoundationD3D11VideoCapture',
+  );
   // Screen / desktop capture reliability (Share Screen / Screen Vision)
   app.commandLine.appendSwitch('enable-usermedia-screen-capturing');
   app.commandLine.appendSwitch('allow-http-screen-capture');
+  // Suppress internal Chromium network upload stream and Media Foundation DLL warnings
+  app.commandLine.appendSwitch('log-level', '3');
+} catch {
+  /* ignore */
+}
+
+// Provide Google API key to Chromium services so speech/network services authenticate properly
+try {
+  if (!process.env.GOOGLE_API_KEY) {
+    const rootEnv = path.join(__dirname, '..', '.env');
+    if (fs.existsSync(rootEnv)) {
+      const content = fs.readFileSync(rootEnv, 'utf8');
+      const m = content.match(/GEMINI_API_KEY\s*=\s*([^\r\n]+)/);
+      if (m && m[1]) {
+        process.env.GOOGLE_API_KEY = m[1].trim().replace(/^["']|["']$/g, '');
+      }
+    }
+  }
 } catch {
   /* ignore */
 }
@@ -193,9 +216,11 @@ function startBackend() {
     const s = d.toString();
     process.stderr.write(`[server] ${s}`);
     logStream.write(`[stderr] ${s}`);
-    // Keep the tail of stderr so the failure dialog can state the actual reason
-    // instead of only an exit code the user cannot act on.
-    recentBackendErrors.push(...s.split(/\r?\n/).filter((line) => line.trim()));
+    const lines = s
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.includes('chunked_data_pipe_upload_data_stream.cc') && !line.includes('mf_initializer.cc'));
+    recentBackendErrors.push(...lines);
     if (recentBackendErrors.length > 8) {
       recentBackendErrors.splice(0, recentBackendErrors.length - 8);
     }
@@ -221,12 +246,40 @@ function startBackend() {
 function killImage(imageName) {
   if (process.platform !== 'win32') return;
   try {
-    // Detached force-kill so installer/uninstall isn't blocked by locked files.
-    spawn('taskkill', ['/F', '/IM', imageName, '/T'], {
-      detached: true,
+    spawnSync('taskkill', ['/F', '/IM', imageName, '/T'], {
       stdio: 'ignore',
       windowsHide: true,
-    }).unref();
+      timeout: 3000,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+function killOrphanedPortProcess(port) {
+  if (process.platform !== 'win32') return;
+  try {
+    const res = spawnSync('netstat', ['-ano', '-p', 'tcp'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 3000,
+    });
+    if (!res.stdout) return;
+    const lines = res.stdout.split('\n');
+    for (const line of lines) {
+      if (line.includes(`:${port}`) && line.includes('LISTENING')) {
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && /^\d+$/.test(pid) && pid !== '0' && Number(pid) !== process.pid) {
+          console.warn(`[BIKLI] Cleaning up orphaned process holding port ${port} (PID ${pid})`);
+          spawnSync('taskkill', ['/pid', pid, '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true,
+            timeout: 3000,
+          });
+        }
+      }
+    }
   } catch {
     /* best-effort */
   }
@@ -236,9 +289,11 @@ function stopBackend() {
   if (serverProcess && !serverProcess.killed) {
     try {
       if (process.platform === 'win32') {
-        // Kill the whole tree so the auto-spawned Python agent goes too.
-        spawn('taskkill', ['/pid', String(serverProcess.pid), '/T', '/F'], {
+        // Synchronously kill the whole process tree so port 3000 is cleanly freed immediately.
+        spawnSync('taskkill', ['/pid', String(serverProcess.pid), '/T', '/F'], {
+          stdio: 'ignore',
           windowsHide: true,
+          timeout: 3000,
         });
       } else {
         // POSIX: the backend is spawned WITHOUT detached:true, so it shares
@@ -333,10 +388,14 @@ function waitForBackend(timeoutMs) {
 // ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
+const appIconPath = fs.existsSync(path.join(__dirname, 'icon.png'))
+  ? path.join(__dirname, 'icon.png')
+  : path.join(__dirname, '../build/icon.ico');
+
 function createSplashWindow() {
   splashWindow = new BrowserWindow({
     width: 420,
-    height: 300,
+    height: 330,
     frame: false,
     transparent: true,
     resizable: false,
@@ -345,6 +404,7 @@ function createSplashWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     backgroundColor: '#00000000',
+    icon: appIconPath,
     webPreferences: { contextIsolation: true, nodeIntegration: false },
   });
   splashWindow.loadFile(path.join(__dirname, 'splash.html'));
@@ -361,6 +421,7 @@ function createMainWindow() {
     backgroundColor: '#0a0a0f',
     autoHideMenuBar: true,
     title: 'BIKLI',
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -587,6 +648,7 @@ async function bootstrap() {
   }
 
   try {
+    killOrphanedPortProcess(SERVER_PORT);
     startBackend();
     await waitForBackend(SERVER_READY_TIMEOUT_MS);
     createMainWindow();

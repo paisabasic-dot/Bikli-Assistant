@@ -173,6 +173,16 @@ On error:
 | `browserFillForm` | Fill multiple form fields and optionally submit |
 | `browserGoBack` / `browserGoForward` | Navigate history |
 | `browserScroll` | Scroll the page up or down |
+| `desktopBrowserExtractText` | Extract clean article and page text for deep research and summarization |
+
+### 🤖 Autonomous Vision & Web Missions (Browser-Use + Claude Computer Use)
+| Tool | Description |
+|---|---|
+| `startAutonomousMission` | Launch an autonomous multi-step visual mission with Set-of-Marks DOM tagging, screenshot vision, and self-healing |
+| `stopAutonomousMission` | Emergency stop the active autonomous mission |
+| `pauseAutonomousMission` | Pause the active autonomous mission |
+| `resumeAutonomousMission` | Resume a paused mission or approve a sensitive action safeguard |
+| `getAutonomousMissionStatus` | Query the real-time step count, thought monologue, and completion status |
 
 ### 💻 Coding Assistance
 | Tool | Description |
